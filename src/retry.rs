@@ -6,6 +6,9 @@ use prost::Message;
 use rand::TryRngCore;
 use scopeguard;
 use std::sync::Arc;
+use wa_rs_binary::builder::NodeBuilder;
+use wa_rs_binary::jid::JidExt as _;
+use wa_rs_binary::node::{Node, NodeContent};
 use wa_rs_core::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
 use wa_rs_core::libsignal::protocol::{
     KeyPair, PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle,
@@ -14,9 +17,6 @@ use wa_rs_core::libsignal::store::PreKeyStore;
 use wa_rs_core::libsignal::store::SessionStore;
 use wa_rs_core::protocol::ProtocolNode;
 use wa_rs_core::types::jid::JidExt;
-use wa_rs_binary::builder::NodeBuilder;
-use wa_rs_binary::jid::JidExt as _;
-use wa_rs_binary::node::{Node, NodeContent};
 
 /// Helper to extract bytes content from a Node.
 fn get_bytes_content(node: &Node) -> Option<&[u8]> {
@@ -191,25 +191,39 @@ impl Client {
                     let device_store = self.persistence_manager.get_device_arc().await;
                     let device_guard = device_store.read().await;
 
-                    if let Ok(session) = device_guard.load_session(&signal_address).await
-                        && let Ok(stored_reg_id) = session.remote_registration_id()
-                        && stored_reg_id != 0
-                        && stored_reg_id != received_reg_id
-                    {
-                        drop(device_guard);
-                        info!(
-                            "Registration ID mismatch for {} (stored: {}, received: {}). \
-                             Deleting session since no key bundle provided.",
-                            signal_address, stored_reg_id, received_reg_id
-                        );
-                        if let Err(del_err) = device_store
-                            .write()
-                            .await
-                            .delete_session(&signal_address)
-                            .await
-                        {
-                            warn!("Failed to delete session for reg ID mismatch: {}", del_err);
-                        }
+                    match device_guard.load_session(&signal_address).await {
+                        Ok(session) => match session.remote_registration_id() {
+                            Ok(stored_reg_id)
+                                if stored_reg_id != 0 && stored_reg_id != received_reg_id =>
+                            {
+                                drop(device_guard);
+                                info!(
+                                    "Registration ID mismatch for {} (stored: {}, received: {}). \
+                                     Deleting session since no key bundle provided.",
+                                    signal_address, stored_reg_id, received_reg_id
+                                );
+                                if let Err(del_err) = device_store
+                                    .write()
+                                    .await
+                                    .delete_session(&signal_address)
+                                    .await
+                                {
+                                    warn!(
+                                        "Failed to delete session for reg ID mismatch: {}",
+                                        del_err
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                "Failed to read stored registration ID for {}: {}",
+                                signal_address, e
+                            ),
+                        },
+                        Err(e) => warn!(
+                            "Failed to load session for {}: {}. Skipping reinstall detection.",
+                            signal_address, e
+                        ),
                     }
                 }
             }
@@ -256,60 +270,73 @@ impl Client {
             // Check for base key collision before deleting the session
             {
                 let device_guard = device_store.read().await;
-                if let Ok(session) = device_guard.load_session(&signal_address).await
-                    && let Ok(current_base_key) = session.alice_base_key()
-                {
-                    if retry_count == MIN_RETRY_FOR_BASE_KEY_CHECK {
-                        // On retry 2: Save the base key for later comparison
-                        if let Err(e) = device_guard
-                            .backend
-                            .save_base_key(&address_str, &message_id, current_base_key)
-                            .await
-                        {
-                            warn!("Failed to save base key for {}: {}", address_str, e);
-                        } else {
-                            info!(
-                                "Saved base key for {} at retry #{} for collision detection",
-                                address_str, retry_count
-                            );
-                        }
-                    } else if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
-                        // On retry > 2: Check if base key is the same (collision detection)
-                        match device_guard
-                            .backend
-                            .has_same_base_key(&address_str, &message_id, current_base_key)
-                            .await
-                        {
-                            Ok(true) => {
-                                // Collision detected! We haven't regenerated our session.
-                                warn!(
-                                    "Base key collision detected for {} at retry #{}. \
-                                     Session hasn't been regenerated. Forcing fresh session.",
-                                    address_str, retry_count
-                                );
-                                // Clean up base key entry since we're deleting the session
-                                let _ = device_guard
+                match device_guard.load_session(&signal_address).await {
+                    Ok(session) => match session.alice_base_key() {
+                        Ok(current_base_key) => {
+                            if retry_count == MIN_RETRY_FOR_BASE_KEY_CHECK {
+                                // On retry 2: Save the base key for later comparison
+                                if let Err(e) = device_guard
                                     .backend
-                                    .delete_base_key(&address_str, &message_id)
-                                    .await;
-                            }
-                            Ok(false) => {
-                                // Base key changed, session was regenerated - good!
-                                info!(
-                                    "Base key changed for {} at retry #{} - session regenerated",
-                                    address_str, retry_count
-                                );
-                                // Clean up old base key entry
-                                let _ = device_guard
+                                    .save_base_key(&address_str, &message_id, current_base_key)
+                                    .await
+                                {
+                                    warn!("Failed to save base key for {}: {}", address_str, e);
+                                } else {
+                                    info!(
+                                        "Saved base key for {} at retry #{} for collision detection",
+                                        address_str, retry_count
+                                    );
+                                }
+                            } else if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
+                                // On retry > 2: Check if base key is the same (collision detection)
+                                match device_guard
                                     .backend
-                                    .delete_base_key(&address_str, &message_id)
-                                    .await;
-                            }
-                            Err(e) => {
-                                warn!("Failed to check base key for {}: {}", address_str, e);
+                                    .has_same_base_key(&address_str, &message_id, current_base_key)
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        // Collision detected! We haven't regenerated our session.
+                                        warn!(
+                                            "Base key collision detected for {} at retry #{}. \
+                                             Session hasn't been regenerated. Forcing fresh session.",
+                                            address_str, retry_count
+                                        );
+                                        // Clean up base key entry since we're deleting the session
+                                        let _ = device_guard
+                                            .backend
+                                            .delete_base_key(&address_str, &message_id)
+                                            .await;
+                                    }
+                                    Ok(false) => {
+                                        // Base key changed, session was regenerated - good!
+                                        info!(
+                                            "Base key changed for {} at retry #{} - session regenerated",
+                                            address_str, retry_count
+                                        );
+                                        // Clean up old base key entry
+                                        let _ = device_guard
+                                            .backend
+                                            .delete_base_key(&address_str, &message_id)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to check base key for {}: {}",
+                                            address_str, e
+                                        );
+                                    }
+                                }
                             }
                         }
-                    }
+                        Err(e) => warn!(
+                            "Failed to read base key for {}: {}. Skipping collision detection.",
+                            address_str, e
+                        ),
+                    },
+                    Err(e) => warn!(
+                        "Failed to load session for {}: {}. Skipping collision detection.",
+                        address_str, e
+                    ),
                 }
             }
 
@@ -391,25 +418,31 @@ impl Client {
         // Check if the registration ID changed (indicates device reinstall).
         let device_store = self.persistence_manager.get_device_arc().await;
         let device_guard = device_store.read().await;
-        if let Ok(session) = device_guard.load_session(&signal_address).await {
-            let existing_reg_id = session.remote_registration_id()?;
-            if existing_reg_id != 0 && existing_reg_id != registration_id {
-                // WhatsApp Web throws an error for peer device registration ID changes.
-                // This is a security measure - peer devices should maintain consistent identity.
-                if is_peer {
-                    return Err(anyhow::anyhow!(
-                        "Registration ID changed for peer device {} (was {}, now {}). \
-                         This may indicate the device was reinstalled.",
-                        signal_address,
-                        existing_reg_id,
-                        registration_id
-                    ));
+        match device_guard.load_session(&signal_address).await {
+            Ok(session) => {
+                let existing_reg_id = session.remote_registration_id()?;
+                if existing_reg_id != 0 && existing_reg_id != registration_id {
+                    // WhatsApp Web throws an error for peer device registration ID changes.
+                    // This is a security measure - peer devices should maintain consistent identity.
+                    if is_peer {
+                        return Err(anyhow::anyhow!(
+                            "Registration ID changed for peer device {} (was {}, now {}). \
+                             This may indicate the device was reinstalled.",
+                            signal_address,
+                            existing_reg_id,
+                            registration_id
+                        ));
+                    }
+                    info!(
+                        "Registration ID changed for {} (was {}, now {}). Session will be replaced.",
+                        signal_address, existing_reg_id, registration_id
+                    );
                 }
-                info!(
-                    "Registration ID changed for {} (was {}, now {}). Session will be replaced.",
-                    signal_address, existing_reg_id, registration_id
-                );
             }
+            Err(e) => warn!(
+                "Failed to load session for {}: {}. Skipping registration ID change check.",
+                signal_address, e
+            ),
         }
         drop(device_guard);
 
@@ -553,10 +586,11 @@ impl Client {
 
             let new_prekey_id = (rand::random::<u32>() % 16777215) + 1;
             let new_prekey_keypair = KeyPair::generate(&mut rand::rngs::OsRng.unwrap_err());
-            let new_prekey_record = wa_rs_core::libsignal::store::record_helpers::new_pre_key_record(
-                new_prekey_id,
-                &new_prekey_keypair,
-            );
+            let new_prekey_record =
+                wa_rs_core::libsignal::store::record_helpers::new_pre_key_record(
+                    new_prekey_id,
+                    &new_prekey_keypair,
+                );
             // This key is not uploaded to the server pool, so mark as false
             if let Err(e) = device_guard
                 .store_prekey(new_prekey_id, new_prekey_record, false)
@@ -770,8 +804,8 @@ mod tests {
     /// Matches WhatsApp Web's sendRetryReceipt: if (to.isUser()) { if (isMeAccount(to)) { ... } }
     #[test]
     fn retry_receipt_attributes_for_device_sync_vs_peer_vs_group() {
-        use wa_rs_core::types::message::{MessageInfo, MessageSource};
         use wa_rs_binary::builder::NodeBuilder;
+        use wa_rs_core::types::message::{MessageInfo, MessageSource};
 
         let our_pn = Jid::pn("559999999999");
         let our_lid = Jid::lid("100000000000001");
