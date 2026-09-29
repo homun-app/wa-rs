@@ -1911,8 +1911,18 @@ impl Client {
     }
 
     pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wa_rs_binary::node::Node) -> bool {
+        // The server's keepalive ping arrives both as a <ping/> child and as
+        // a childless <iq xmlns="urn:xmpp:ping"/>; without answering the
+        // attribute form the server drops the connection within a minute.
+        let is_ping = node
+            .attrs
+            .get("xmlns")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "urn:xmpp:ping")
+            .unwrap_or(false)
+            || node.get_optional_child("ping").is_some();
         if let Some("get") = node.attrs.get("type").and_then(|s| s.as_str())
-            && node.get_optional_child("ping").is_some()
+            && is_ping
         {
             info!("Received ping, sending pong.");
             let mut parser = node.attrs();
