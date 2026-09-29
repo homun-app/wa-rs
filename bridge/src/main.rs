@@ -48,27 +48,33 @@ struct AppState {
     pair_code: RwLock<Option<(String, DateTime<Utc>)>>,
     jid: RwLock<Option<String>>,
     lid: RwLock<Option<String>>,
+    self_chat_peer: RwLock<Option<String>>,
+    pending_own: RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>,
     connected: RwLock<bool>,
     logged_out: RwLock<bool>,
     last_error: RwLock<Option<String>>,
     last_pair_error: RwLock<Option<String>>,
     started_at: DateTime<Utc>,
+    db_path: String,
     callback: Callback,
 }
 
 impl AppState {
-    fn new(callback: Callback) -> Arc<Self> {
+    fn new(callback: Callback, db_path: String) -> Arc<Self> {
         Arc::new(Self {
             client: RwLock::new(None),
             qr: RwLock::new(None),
             pair_code: RwLock::new(None),
             jid: RwLock::new(None),
             lid: RwLock::new(None),
+            self_chat_peer: RwLock::new(None),
+            pending_own: RwLock::new(std::collections::HashMap::new()),
             connected: RwLock::new(false),
             logged_out: RwLock::new(false),
             last_error: RwLock::new(None),
             last_pair_error: RwLock::new(None),
             started_at: Utc::now(),
+            db_path,
             callback,
         })
     }
@@ -117,8 +123,8 @@ fn identity_path(db_path: &str) -> std::path::PathBuf {
     std::path::Path::new(db_path).with_extension("identity.json")
 }
 
-fn persist_identity(db_path: &str, jid: &str, lid: &str) {
-    let doc = json!({"jid": jid, "lid": lid});
+fn persist_identity(db_path: &str, jid: &str, lid: &str, self_chat_peer: Option<&str>) {
+    let doc = json!({"jid": jid, "lid": lid, "self_chat_peer": self_chat_peer});
     if let Err(e) = std::fs::write(identity_path(db_path), doc.to_string()) {
         log::warn!("failed to persist bridge identity: {e}");
     }
@@ -136,6 +142,9 @@ async fn restore_identity(state: &Arc<AppState>, db_path: &str) {
     }
     if let Some(lid) = doc.get("lid").and_then(Value::as_str) {
         *state.lid.write().await = Some(lid.to_string());
+    }
+    if let Some(peer) = doc.get("self_chat_peer").and_then(Value::as_str) {
+        *state.self_chat_peer.write().await = Some(peer.to_string());
     }
     log::info!("restored paired identity from session store");
 }
@@ -242,7 +251,7 @@ async fn main() {
         token: env_or("WA_BRIDGE_CALLBACK_TOKEN", ""),
     };
 
-    let state = AppState::new(callback);
+    let state = AppState::new(callback, db_path.clone());
     restore_identity(&state, &db_path).await;
 
     let backend = match SqliteStore::new(&db_path).await {
@@ -300,7 +309,7 @@ async fn main() {
                         *state.lid.write().await = Some(success.lid.to_string());
                         *state.logged_out.write().await = false;
                         *state.last_pair_error.write().await = None;
-                        persist_identity(&db_path, &success.id.to_string(), &success.lid.to_string());
+                        persist_identity(&db_path, &success.id.to_string(), &success.lid.to_string(), None);
                     }
                     Event::PairError(err) => {
                         // The phone showed an error: keep the server-provided
@@ -386,41 +395,84 @@ async fn main() {
 
 async fn handle_message(state: &Arc<AppState>, ctx: MessageContext) {
     let info = &ctx.info;
-    // Own messages are skipped, except in the self-chat: notes the user writes
-    // to themselves on the phone sync to linked devices flagged is_from_me.
-    // The account owns two identities (phone Jid and LID), so the chat is
-    // compared by bare user part against both.
+    let text_len = ctx.message.text_content().map(|t| t.len());
+    log::info!(
+        "inbound message: chat={} sender={} is_from_me={} is_group={} text_len={:?}",
+        info.source.chat, info.source.sender, info.source.is_from_me, info.source.is_group, text_len
+    );
+    // Own outbound traffic is remembered, not forwarded: in the self-chat
+    // ("message yourself") WhatsApp echoes the note back through a system
+    // companion JID as ordinary inbound traffic, and that echo is the copy
+    // the engine should answer.
     if info.source.is_from_me {
-        let jid = state.jid.read().await.clone();
-        let lid = state.lid.read().await.clone();
-        let own_users: Vec<String> = [jid, lid]
-            .into_iter()
-            .flatten()
-            .map(|full| full.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_string())
-            .filter(|user| !user.is_empty())
-            .collect();
-        let chat_user = info.source.chat.user.clone();
-        if !own_users.contains(&chat_user) {
-            return;
+        if let Some(text) = ctx.message.text_content() {
+            state
+                .pending_own
+                .write()
+                .await
+                .insert(info.source.chat.to_string(), (text.to_string(), std::time::Instant::now()));
+        }
+        log::info!("dropped own message outside the self-chat echo path");
+        return;
+    }
+    let sender = info.source.sender.to_string();
+    let chat_key = info.source.chat.to_string();
+    let mut self_echo = *state.self_chat_peer.read().await == Some(sender.clone());
+    if !self_echo {
+        // Discovery: an inbound copy of the account's own recent note in the
+        // same chat identifies the self-chat companion JID. Once learned it is
+        // persisted and later echoes match by sender alone.
+        let mut pending = state.pending_own.write().await;
+        let matched = pending
+            .get(&chat_key)
+            .map(|(text, at)| {
+                text_matches(text, &ctx.message) && at.elapsed() < std::time::Duration::from_secs(30)
+            })
+            .unwrap_or(false);
+        if matched {
+            pending.remove(&chat_key);
+            *state.self_chat_peer.write().await = Some(sender.clone());
+            let jid = state.jid.read().await.clone();
+            let lid = state.lid.read().await.clone();
+            persist_identity(&state.db_path, jid.as_deref().unwrap_or(""), lid.as_deref().unwrap_or(""), Some(&sender));
+            log::info!("learned self-chat companion {sender}");
+            self_echo = true;
         }
     }
     let Some(text) = ctx.message.text_content() else {
+        log::info!("dropped message without text content");
         return; // v1 bridges text messages only.
     };
     if text.trim().is_empty() {
+        log::info!("dropped empty message");
         return;
     }
-    let body = json!({
+    let owner_jid = state.jid.read().await.clone();
+    let owner_lid = state.lid.read().await.clone();
+    let mut body = json!({
         "source": "wa-rs-bridge",
         "message": {
             "id": info.id.clone(),
-            "chat": info.source.chat.to_string(),
-            "sender": info.source.sender.to_string(),
+            "chat": chat_key,
+            "sender": sender,
             "push_name": info.push_name.clone(),
             "is_group": info.source.is_group,
             "text": text,
             "timestamp": info.timestamp.to_rfc3339(),
         }
     });
+    if self_echo {
+        // Attribute the echo to the account owner so the engine's
+        // authorization gate and conversation identity see the human.
+        if let Some(obj) = body.get_mut("message").and_then(Value::as_object_mut) {
+            obj.insert("self_echo".into(), json!(true));
+            obj.insert("owner".into(), json!({"jid": owner_jid, "lid": owner_lid}));
+        }
+    }
+    log::info!("forwarding message to engine callback ({} bytes, self_echo={self_echo})", text.len());
     push_callback(&state.callback, body).await;
+}
+
+fn text_matches(pending: &str, message: &wa::Message) -> bool {
+    message.text_content().as_deref() == Some(pending)
 }
