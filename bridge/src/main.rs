@@ -50,6 +50,7 @@ struct AppState {
     connected: RwLock<bool>,
     logged_out: RwLock<bool>,
     last_error: RwLock<Option<String>>,
+    last_pair_error: RwLock<Option<String>>,
     started_at: DateTime<Utc>,
     callback: Callback,
 }
@@ -64,6 +65,7 @@ impl AppState {
             connected: RwLock::new(false),
             logged_out: RwLock::new(false),
             last_error: RwLock::new(None),
+            last_pair_error: RwLock::new(None),
             started_at: Utc::now(),
             callback,
         })
@@ -76,6 +78,7 @@ impl AppState {
         let qr = self.qr.read().await.clone();
         let pair_code = self.pair_code.read().await.clone();
         let last_error = self.last_error.read().await.clone();
+        let last_pair_error = self.last_pair_error.read().await.clone();
         let paired = connected && !logged_out;
         json!({
             "ok": true,
@@ -87,6 +90,7 @@ impl AppState {
             "logged_out": logged_out,
             "started_at": self.started_at.to_rfc3339(),
             "last_error": last_error,
+            "last_pair_error": last_pair_error,
             "qr": qr.as_ref().map(|(payload, expires)| json!({
                 "payload": payload,
                 "expires_at": expires.to_rfc3339(),
@@ -253,6 +257,20 @@ async fn main() {
                         log::info!("paired as {}", success.id);
                         *state.jid.write().await = Some(success.id.to_string());
                         *state.logged_out.write().await = false;
+                        *state.last_pair_error.write().await = None;
+                    }
+                    Event::PairError(err) => {
+                        // The phone showed an error: keep the server-provided
+                        // reason for /status so the app can display it.
+                        log::error!("pairing rejected: {} (platform {})", err.error, err.platform);
+                        *state.last_pair_error.write().await =
+                            Some(format!("{} (platform {})", err.error, err.platform));
+                    }
+                    Event::QrScannedWithoutMultidevice(_) => {
+                        log::error!("QR scanned but the account has no multidevice support");
+                        *state.last_pair_error.write().await = Some(
+                            "QR scansionato ma l'account non supporta i dispositivi collegati (multidevice)".to_string(),
+                        );
                     }
                     Event::Connected(_) => {
                         log::info!("WhatsApp session connected");
