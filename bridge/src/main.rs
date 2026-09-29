@@ -218,21 +218,24 @@ async fn send(
     }
     // Accept bare phone numbers as well as full JIDs.
     let mut jid_str = if to.contains('@') { to } else { format!("{to}@s.whatsapp.net") };
-    // Self-chat routing: replies addressed to the self-chat companion JID are
-    // accepted by the server but land in an invisible system chat. "Message
-    // yourself" renders notes sent to the account's own JID, so redirect.
+    // Self-chat routing: the self-chat only renders notes sent to the
+    // account's phone-number JID. The companion JID and the account's LID
+    // form are accepted by the server but land in invisible chats, so every
+    // self-directed destination is rewritten to the bare PN form.
     {
+        let bare = |s: &str| s.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+        let own_jid = state.jid.read().await.clone();
+        let own_lid = state.lid.read().await.clone();
         let peer = state.self_chat_peer.read().await.clone();
-        if let Some(peer) = peer {
-            let bare = |s: &str| s.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
-            let peer_user = bare(&peer);
-            if !peer_user.is_empty() && peer_user == bare(&jid_str) {
-                let own = state.jid.read().await.clone();
-                let own = if own.is_some() { own } else { state.lid.read().await.clone() };
-                if let Some(own) = own {
-                    jid_str = bare(&own) + "@s.whatsapp.net";
-                }
-            }
+        let own_pn = own_jid.as_deref().map(bare).unwrap_or_default();
+        let own_lid_user = own_lid.as_deref().map(bare).unwrap_or_default();
+        let peer_user = peer.as_deref().map(bare).unwrap_or_default();
+        let to_user = bare(&jid_str);
+        let is_self_destination = !own_pn.is_empty()
+            && (to_user == own_pn || (!own_lid_user.is_empty() && to_user == own_lid_user)
+                || (!peer_user.is_empty() && to_user == peer_user));
+        if is_self_destination {
+            jid_str = format!("{own_pn}@s.whatsapp.net");
         }
     }
     let Ok(jid) = jid_str.parse() else {
