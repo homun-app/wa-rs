@@ -40,12 +40,9 @@ impl LTHash {
 
 fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool) {
     assert_eq!(base.len(), input.len(), "length mismatch");
-    assert!(base.len() % 2 == 0, "slice lengths must be even");
+    assert!(base.len().is_multiple_of(2), "slice lengths must be even");
 
-    for (base_pair, input_pair) in base
-        .chunks_exact_mut(2)
-        .zip(input.chunks_exact(2))
-    {
+    for (base_pair, input_pair) in base.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
         let x = u16::from_le_bytes([base_pair[0], base_pair[1]]);
         let y = u16::from_le_bytes([input_pair[0], input_pair[1]]);
 

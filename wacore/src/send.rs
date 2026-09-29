@@ -509,7 +509,7 @@ pub async fn prepare_dm_stanza<
     }
 
     let stanza = NodeBuilder::new("message")
-        .attrs(stanza_attrs.into_iter())
+        .attrs(stanza_attrs)
         .children(message_content_nodes)
         .build();
 
@@ -843,7 +843,7 @@ pub async fn prepare_group_stanza<
     message_children.extend(extra_stanza_nodes);
 
     let stanza = NodeBuilder::new("message")
-        .attrs(stanza_attrs.into_iter())
+        .attrs(stanza_attrs)
         .children(message_children)
         .build();
 
