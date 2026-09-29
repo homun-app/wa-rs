@@ -124,7 +124,6 @@ pub fn build_spam_list_node(request: &SpamReportRequest) -> Node {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -150,13 +149,16 @@ mod tests {
         let node = build_spam_list_node(&request);
 
         assert_eq!(node.tag, "spam_list");
-        assert_eq!(node.attrs().string("spam_flow"), "MessageMenu");
+        assert_eq!(
+            node.attrs().optional_string("spam_flow").unwrap(),
+            "MessageMenu"
+        );
 
         let message = node
             .get_optional_child_by_tag(&["message"])
             .expect("test node child should exist");
-        assert_eq!(message.attrs().string("id"), "TEST123");
-        assert_eq!(message.attrs().string("t"), "1234567890");
+        assert_eq!(message.attrs().optional_string("id").unwrap(), "TEST123");
+        assert_eq!(message.attrs().optional_string("t").unwrap(), "1234567890");
     }
 
     #[test]
@@ -179,8 +181,8 @@ mod tests {
             .get_optional_child_by_tag(&["raw"])
             .expect("test node child should exist");
 
-        assert_eq!(raw.attrs().string("v"), "3");
-        assert_eq!(raw.attrs().string("mediatype"), "image");
+        assert_eq!(raw.attrs().optional_string("v").unwrap(), "3");
+        assert_eq!(raw.attrs().optional_string("mediatype").unwrap(), "image");
     }
 
     #[test]
@@ -197,8 +199,17 @@ mod tests {
 
         let node = build_spam_list_node(&request);
 
-        assert_eq!(node.attrs().string("spam_flow"), "GroupInfoReport");
-        assert_eq!(node.attrs().string("jid"), "120363025918861132@g.us");
-        assert_eq!(node.attrs().string("subject"), "Test Group");
+        assert_eq!(
+            node.attrs().optional_string("spam_flow").unwrap(),
+            "GroupInfoReport"
+        );
+        assert_eq!(
+            node.attrs().optional_string("jid").unwrap(),
+            "120363025918861132@g.us"
+        );
+        assert_eq!(
+            node.attrs().optional_string("subject").unwrap(),
+            "Test Group"
+        );
     }
 }
