@@ -1,6 +1,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use std::time::Duration;
 use wa_rs_core::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse};
+
+/// Connection establishment timeout (DNS + TCP + TLS handshake).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// End-to-end cap for buffered requests in `execute` (includes reading the body).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Cap for receiving response headers in streaming requests. Body reading stays
+/// unbounded on purpose: it is driven by the download code, which retries hosts.
+const STREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP client implementation using `ureq` for synchronous HTTP requests.
 /// Since `ureq` is blocking, all requests are wrapped in `tokio::task::spawn_blocking`.
@@ -26,14 +35,22 @@ impl HttpClient for UreqHttpClient {
         tokio::task::spawn_blocking(move || {
             let response = match request.method.as_str() {
                 "GET" => {
-                    let mut req = ureq::get(&request.url);
+                    let mut req = ureq::get(&request.url)
+                        .config()
+                        .timeout_connect(Some(CONNECT_TIMEOUT))
+                        .timeout_global(Some(REQUEST_TIMEOUT))
+                        .build();
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
                     req.call()?
                 }
                 "POST" => {
-                    let mut req = ureq::post(&request.url);
+                    let mut req = ureq::post(&request.url)
+                        .config()
+                        .timeout_connect(Some(CONNECT_TIMEOUT))
+                        .timeout_global(Some(REQUEST_TIMEOUT))
+                        .build();
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
@@ -68,7 +85,11 @@ impl HttpClient for UreqHttpClient {
         // in one blocking thread.
         let response = match request.method.as_str() {
             "GET" => {
-                let mut req = ureq::get(&request.url);
+                let mut req = ureq::get(&request.url)
+                    .config()
+                    .timeout_connect(Some(CONNECT_TIMEOUT))
+                    .timeout_recv_response(Some(STREAM_HEADERS_TIMEOUT))
+                    .build();
                 for (key, value) in &request.headers {
                     req = req.header(key, value);
                 }
