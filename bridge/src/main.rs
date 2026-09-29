@@ -117,7 +117,13 @@ async fn push_callback(callback: &Callback, body: Value) {
     let token = callback.token.clone();
     let payload = body.to_string();
     tokio::task::spawn_blocking(move || {
-        let mut req = ureq::post(&url);
+        // Same policy as the workspace ureq client: bounded connect and
+        // global timeouts so a stuck engine can't pile up callback threads.
+        let mut req = ureq::post(&url)
+            .config()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build();
         req = req.header("Content-Type", "application/json");
         if !token.is_empty() {
             req = req.header("Authorization", format!("Bearer {token}"));
