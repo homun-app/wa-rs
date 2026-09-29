@@ -2,11 +2,11 @@ use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use wa_rs_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
 use wa_rs_core::handshake::NoiseHandshake;
 use wa_rs_core::libsignal::crypto::CryptographicHash;
 use wa_rs_core::libsignal::protocol::{PrivateKey, PublicKey};
 use wa_rs_core::noise::generate_iv;
-use wa_rs_binary::consts::{NOISE_START_PATTERN, WA_CONN_HEADER};
 
 fn hex_to_bytes<const N: usize>(hex_str: &str) -> [u8; N] {
     hex::decode(hex_str)
@@ -169,7 +169,7 @@ fn test_full_handshake_flow_with_go_data() {
         hex_to_bytes::<32>("4a82b448599eb44f85bacedaff0a81820999a87be156b08989c2857b8651d4d2");
 
     println!("Step 1: Prologue");
-    let mut nh = NoiseHandshake::new(NOISE_START_PATTERN, wa_header)
+    let mut nh = NoiseHandshake::new(NOISE_PATTERN_XX, wa_header)
         .expect("noise handshake should initialize");
     assert_eq!(*nh.hash(), hash_after_prologue, "Mismatch after prologue");
 

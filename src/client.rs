@@ -158,6 +158,13 @@ pub struct Client {
     /// Incremented on every successful `connect()`, so exactly one keepalive
     /// loop survives rapid reconnect cycles (see `keepalive_loop`).
     pub(crate) connect_epoch: Arc<AtomicU64>,
+    /// Per-process counter of consecutive Noise IK handshake failures, scoped
+    /// to the lifetime of this `Client`. Mirrors `K` in WA Web's
+    /// `WAWebOpenChatSocket` (`ChatSocket.js`): on the first failure within a
+    /// process, the next connect skips IK and falls back to XX so a stale
+    /// cached `serverStaticPublic` doesn't trap us in a loop. Reset to 0 on
+    /// any successful handshake (XX, IK, or XXfallback).
+    pub(crate) ik_handshake_failures: Arc<AtomicU32>,
     /// Dead-socket watchdog: armed on the first send after a receive, cancelled
     /// on every receive; checked by the keepalive loop (WA Web `deadSocketTimer`).
     pub(crate) data_watchdog: crate::keepalive::DataWatchdog,
@@ -326,6 +333,7 @@ impl Client {
             expected_disconnect: Arc::new(AtomicBool::new(false)),
             connection_generation: Arc::new(AtomicU64::new(0)),
             connect_epoch: Arc::new(AtomicU64::new(0)),
+            ik_handshake_failures: Arc::new(AtomicU32::new(0)),
             data_watchdog: crate::keepalive::DataWatchdog::default(),
 
             // Recent messages cache for retry functionality
@@ -606,10 +614,9 @@ impl Client {
         }
         debug!("Version fetch and transport connection established.");
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-
         let noise_socket = match handshake::do_handshake(
-            &device_snapshot,
+            &self.persistence_manager,
+            &self.ik_handshake_failures,
             transport.clone(),
             &mut transport_events,
         )

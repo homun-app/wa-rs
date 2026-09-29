@@ -51,10 +51,10 @@ use crate::types::events::Event;
 use log::{error, info, warn};
 use rand::TryRngCore;
 use std::sync::Arc;
-use wa_rs_core::libsignal::protocol::KeyPair;
-use wa_rs_core::pair_code::{PairCodeError, PairCodeState, PairCodeUtils};
 use wa_rs_binary::jid::{Jid, SERVER_JID};
 use wa_rs_binary::node::{Node, NodeContent};
+use wa_rs_core::libsignal::protocol::KeyPair;
+use wa_rs_core::pair_code::{PairCodeError, PairCodeState, PairCodeUtils};
 
 // Re-export types for user convenience
 pub use wa_rs_core::pair_code::{PairCodeOptions, PlatformId};
@@ -325,11 +325,8 @@ pub(crate) async fn handle_pair_code_notification(client: &Arc<Client>, node: &N
     // Get device keys
     let device_snapshot = client.persistence_manager.get_device_snapshot().await;
 
-    // Prepare encrypted key bundle
-    // TODO: Store `new_adv_secret` via DeviceCommand::SetAdvSecretKey to enable HMAC
-    // verification in pair-success. Currently the HMAC check in do_pair_crypto is
-    // commented out, so pairing works without it. See wa_rs_core/src/pair.rs:147-153.
-    let (wrapped_bundle, _new_adv_secret) = match PairCodeUtils::prepare_key_bundle(
+    // Prepare encrypted key bundle (includes the rotated adv_secret_key).
+    let (wrapped_bundle, new_adv_secret) = match PairCodeUtils::prepare_key_bundle(
         &ephemeral_keypair,
         &primary_ephemeral_pub,
         &primary_identity_pub,
@@ -341,6 +338,16 @@ pub(crate) async fn handle_pair_code_notification(client: &Arc<Client>, node: &N
             return false;
         }
     };
+
+    // Persist the rotated adv_secret_key so HMAC verification works when the
+    // pair-success arrives: the primary learns this secret through the pair-code
+    // DH and keys the signed-device-identity HMAC with it (oxidezap #594).
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAdvSecretKey(
+            new_adv_secret,
+        ))
+        .await;
 
     // Build and send stage 2 IQ
     let req_id = client.generate_request_id();

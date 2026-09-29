@@ -9,6 +9,15 @@ pub enum NoiseError {
     #[error("Cryptographic operation failed: {0}")]
     CryptoError(String),
 
+    #[error("AES-GCM encryption failed: {0}")]
+    Encrypt(String),
+
+    #[error("AES-GCM decryption failed: {0}")]
+    Decrypt(String),
+
+    #[error("ciphertext too short to contain authentication tag")]
+    CiphertextTooShort,
+
     #[error("HKDF expansion failed")]
     HkdfExpandFailed,
 

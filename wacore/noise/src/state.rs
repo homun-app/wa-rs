@@ -53,7 +53,7 @@ impl NoiseCipher {
         let iv = generate_iv(counter);
         self.inner
             .encrypt(iv.as_ref().into(), plaintext)
-            .map_err(|e| NoiseError::CryptoError(e.to_string()))
+            .map_err(|e| NoiseError::Encrypt(e.to_string()))
     }
 
     /// Encrypts plaintext in-place within the provided buffer.
@@ -64,7 +64,7 @@ impl NoiseCipher {
         let iv = generate_iv(counter);
         self.inner
             .encrypt_in_place(iv.as_ref().into(), b"", buffer)
-            .map_err(|e| NoiseError::CryptoError(e.to_string()))
+            .map_err(|e| NoiseError::Encrypt(e.to_string()))
     }
 
     /// Decrypts ciphertext using the specified counter for IV generation.
@@ -72,9 +72,12 @@ impl NoiseCipher {
     /// The ciphertext should include the 16-byte authentication tag.
     pub fn decrypt_with_counter(&self, counter: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let iv = generate_iv(counter);
+        if ciphertext.len() < 16 {
+            return Err(NoiseError::CiphertextTooShort);
+        }
         self.inner
             .decrypt(iv.as_ref().into(), ciphertext)
-            .map_err(|e| NoiseError::CryptoError(format!("Decrypt failed: {e}")))
+            .map_err(|e| NoiseError::Decrypt(e.to_string()))
     }
 
     /// Decrypts ciphertext in-place within the provided buffer.
@@ -83,18 +86,13 @@ impl NoiseCipher {
     /// After decryption, it will contain the plaintext (tag is removed).
     pub fn decrypt_in_place_with_counter(&self, counter: u32, buffer: &mut Vec<u8>) -> Result<()> {
         let iv = generate_iv(counter);
+        if buffer.len() < 16 {
+            return Err(NoiseError::CiphertextTooShort);
+        }
         self.inner
             .decrypt_in_place(iv.as_ref().into(), b"", buffer)
-            .map_err(|e| NoiseError::CryptoError(format!("Decrypt failed: {e}")))
+            .map_err(|e| NoiseError::Decrypt(e.to_string()))
     }
-}
-
-fn to_array(slice: &[u8], name: &'static str) -> Result<[u8; 32]> {
-    slice.try_into().map_err(|_| NoiseError::InvalidKeyLength {
-        name,
-        expected: 32,
-        got: slice.len(),
-    })
 }
 
 fn sha256_digest(data: &[u8]) -> [u8; 32] {
@@ -161,14 +159,16 @@ impl NoiseState {
 
     /// Creates a new Noise state with the given pattern and prologue.
     ///
-    /// The pattern should be exactly 32 bytes (used directly as initial hash)
-    /// or any other length (will be SHA-256 hashed to derive initial state).
+    /// Per Noise spec § 5.2: when `protocol_name` is ≤ HASHLEN bytes, append
+    /// zero bytes to make HASHLEN; otherwise hash with SHA-256.
     ///
     /// The prologue is authenticated into the hash state.
     pub fn new(pattern: impl AsRef<[u8]>, prologue: &[u8]) -> Result<Self> {
         let pattern = pattern.as_ref();
-        let h: [u8; 32] = if pattern.len() == 32 {
-            to_array(pattern, "noise pattern prefix")?
+        let h: [u8; 32] = if pattern.len() <= 32 {
+            let mut h = [0u8; 32];
+            h[..pattern.len()].copy_from_slice(pattern);
+            h
         } else {
             sha256_digest(pattern)
         };
@@ -235,7 +235,7 @@ impl NoiseState {
         let tag = self
             .cipher
             .encrypt_in_place_detached(iv.as_ref().into(), &aad, &mut out[start..])
-            .map_err(|e| NoiseError::CryptoError(e.to_string()))?;
+            .map_err(|e| NoiseError::Encrypt(e.to_string()))?;
 
         // Append the authentication tag
         out.extend_from_slice(&tag);
@@ -256,7 +256,7 @@ impl NoiseState {
         let plaintext = self
             .cipher
             .decrypt(iv.as_ref().into(), payload)
-            .map_err(|e| NoiseError::CryptoError(format!("Noise decrypt failed: {e}")))?;
+            .map_err(|e| NoiseError::Decrypt(e.to_string()))?;
 
         self.authenticate(ciphertext);
         Ok(plaintext)
@@ -270,9 +270,7 @@ impl NoiseState {
         const TAG_LEN: usize = 16;
 
         if ciphertext.len() < TAG_LEN {
-            return Err(NoiseError::CryptoError(
-                "Ciphertext too short (missing tag)".into(),
-            ));
+            return Err(NoiseError::CiphertextTooShort);
         }
 
         let aad = self.hash;
@@ -290,7 +288,7 @@ impl NoiseState {
         // Decrypt in-place
         self.cipher
             .decrypt_in_place_detached(iv.as_ref().into(), &aad, &mut out[start..], tag.into())
-            .map_err(|e| NoiseError::CryptoError(format!("Noise decrypt failed: {e}")))?;
+            .map_err(|e| NoiseError::Decrypt(e.to_string()))?;
 
         // Authenticate with the original ciphertext (including tag)
         self.authenticate(ciphertext);
@@ -353,6 +351,20 @@ mod tests {
 
         let iv = generate_iv(0x01020304);
         assert_eq!(iv, [0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn test_protocol_name_short_is_zero_padded() {
+        // Spec § 5.2: name <= HASHLEN bytes is zero-padded, NOT hashed.
+        // The 28-byte unpadded form must produce the same h0 as the 32-byte
+        // pre-padded form, after applying the same prologue.
+        let prologue = b"test";
+        let unpadded = NoiseState::new(b"Noise_XX_25519_AESGCM_SHA256", prologue)
+            .expect("unpadded init should succeed");
+        let padded = NoiseState::new(b"Noise_XX_25519_AESGCM_SHA256\0\0\0\0", prologue)
+            .expect("padded init should succeed");
+        assert_eq!(unpadded.hash(), padded.hash());
+        assert_eq!(unpadded.salt(), padded.salt());
     }
 
     #[test]

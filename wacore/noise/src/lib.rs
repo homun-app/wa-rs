@@ -24,9 +24,10 @@
 //! # Example (WhatsApp)
 //!
 //! ```ignore
-//! use wa_rs_noise::{NoiseHandshake, HandshakeUtils};
+//! use wa_rs_noise::NoiseHandshake;
+//! use wa_rs_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
 //!
-//! let mut nh = NoiseHandshake::new(NOISE_START_PATTERN, &WA_CONN_HEADER)?;
+//! let mut nh = NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER)?;
 //! nh.authenticate(&ephemeral_public);
 //! nh.mix_shared_secret(&private_key, &their_public)?;
 //! let (write_key, read_key) = nh.finish()?;
@@ -38,13 +39,17 @@ pub mod framing;
 mod handshake;
 mod state;
 
+#[cfg(test)]
+pub mod test_util;
+
 pub use aes_gcm::Aes256Gcm;
 pub use edge_routing::{
     EdgeRoutingError, MAX_EDGE_ROUTING_LEN, build_edge_routing_preintro, build_handshake_header,
 };
 pub use error::{NoiseError, Result};
 pub use handshake::{
-    HandshakeError, HandshakeState, HandshakeUtils, NoiseHandshake, Result as HandshakeResult,
-    WA_CERT_PUB_KEY,
+    HandshakeError, HandshakeUtils, IkFallbackInputs, IkHandshakeOutcome, IkHandshakeState,
+    IkServerHelloOutcome, NoiseHandshake, Result as HandshakeResult, VerifiedServerCertChain,
+    WA_CERT_PUB_KEY, XxFallbackHandshakeState, XxHandshakeOutcome, XxHandshakeState,
 };
 pub use state::{NoiseCipher, NoiseKeys, NoiseState, generate_iv};

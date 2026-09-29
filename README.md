@@ -4,6 +4,8 @@ A high-performance, async Rust client for the WhatsApp Web API.
 
 Fork of [whatsapp-rust](https://github.com/jlucaso1/whatsapp-rust) by João Lucas de Oliveira Lopes, with stable Rust support (no nightly features required) and bug fixes.
 
+> **Note on upstream**: the original project has moved and is actively developed as [oxidezap/whatsapp-rust](https://github.com/oxidezap/whatsapp-rust). This fork tracks it selectively (pairing/ADV-HMAC, device props, Noise IK + XXfallback handshake); check the upstream before filing protocol-level issues here.
+
 Inspired by [whatsmeow](https://github.com/tulir/whatsmeow) (Go) and [Baileys](https://github.com/WhiskeySockets/Baileys) (TypeScript).
 
 ## Features

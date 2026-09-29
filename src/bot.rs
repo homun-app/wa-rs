@@ -174,7 +174,10 @@ impl Bot {
                         platform: String::new(),
                         error: format!("Socket timeout: {e}"),
                     };
-                    client_for_pair.core.event_bus.dispatch(&Event::PairError(pair_error));
+                    client_for_pair
+                        .core
+                        .event_bus
+                        .dispatch(&Event::PairError(pair_error));
                     return;
                 }
 
@@ -199,7 +202,10 @@ impl Bot {
                             platform: String::new(),
                             error: format!("{e}"),
                         };
-                        client_for_pair.core.event_bus.dispatch(&Event::PairError(pair_error));
+                        client_for_pair
+                            .core
+                            .event_bus
+                            .dispatch(&Event::PairError(pair_error));
                     }
                 }
             });
@@ -222,11 +228,7 @@ pub struct BotBuilder {
     transport_factory: Option<Arc<dyn crate::transport::TransportFactory>>,
     http_client: Option<Arc<dyn crate::http::HttpClient>>,
     override_version: Option<(u32, u32, u32)>,
-    os_info: Option<(
-        Option<String>,
-        Option<wa::device_props::AppVersion>,
-        Option<wa::device_props::PlatformType>,
-    )>,
+    device_props_override: Option<wa_rs_core::store::device::DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
 }
@@ -240,7 +242,7 @@ impl BotBuilder {
             transport_factory: None,
             http_client: None,
             override_version: None,
-            os_info: None,
+            device_props_override: None,
             pair_code_options: None,
             skip_history_sync: false,
         }
@@ -409,7 +411,22 @@ impl BotBuilder {
         version: Option<wa::device_props::AppVersion>,
         platform_type: Option<wa::device_props::PlatformType>,
     ) -> Self {
-        self.os_info = Some((os_name, version, platform_type));
+        let mut r#override = wa_rs_core::store::device::DevicePropsOverride::new();
+        r#override.os = os_name;
+        r#override.version = version;
+        r#override.platform_type = platform_type;
+        self.device_props_override = Some(r#override);
+        self
+    }
+
+    /// Configure device props with full control, including the
+    /// `HistorySyncConfig` (see `wa_rs_core::store::device::DevicePropsOverride`
+    /// and `default_history_sync_config`).
+    pub fn with_device_props_override(
+        mut self,
+        r#override: wa_rs_core::store::device::DevicePropsOverride,
+    ) -> Self {
+        self.device_props_override = Some(r#override);
         self
     }
 
@@ -509,17 +526,15 @@ impl BotBuilder {
             .run_background_saver(std::time::Duration::from_secs(30));
 
         // Apply device props override if specified
-        if let Some((os_name, version, platform_type)) = self.os_info {
+        if let Some(r#override) = self.device_props_override
+            && !r#override.is_empty()
+        {
             info!(
                 "Applying device props override: os={:?}, version={:?}, platform_type={:?}",
-                os_name, version, platform_type
+                r#override.os, r#override.version, r#override.platform_type
             );
             persistence_manager
-                .process_command(DeviceCommand::SetDeviceProps(
-                    os_name,
-                    version,
-                    platform_type,
-                ))
+                .process_command(DeviceCommand::SetDeviceProps(r#override))
                 .await;
         }
 
@@ -529,7 +544,9 @@ impl BotBuilder {
         if self.pair_code_options.is_some() {
             let snapshot = persistence_manager.get_device_snapshot().await;
             if snapshot.pn.is_some() {
-                info!("Pair code requested with existing session — clearing device identity for fresh pairing");
+                info!(
+                    "Pair code requested with existing session — clearing device identity for fresh pairing"
+                );
                 persistence_manager
                     .process_command(DeviceCommand::SetId(None))
                     .await;

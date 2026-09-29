@@ -40,6 +40,7 @@ type DeviceRow = (
     i64,
     Option<Vec<u8>>,
     Option<String>,
+    Option<Vec<u8>>,
 );
 
 #[derive(Clone)]
@@ -227,6 +228,14 @@ impl SqliteStore {
         let app_version_last_fetched_ms = device_data.app_version_last_fetched_ms;
         let edge_routing_info = device_data.edge_routing_info.clone();
         let props_hash = device_data.props_hash.clone();
+        let server_cert_chain: Option<Vec<u8>> = device_data
+            .server_cert_chain
+            .as_ref()
+            .map(|chain| {
+                bincode::serde::encode_to_vec(chain, bincode::config::standard())
+                    .map_err(|e| StoreError::Serialization(e.to_string()))
+            })
+            .transpose()?;
         let new_lid = device_data
             .lid
             .as_ref()
@@ -263,6 +272,7 @@ impl SqliteStore {
                     device::app_version_last_fetched_ms.eq(app_version_last_fetched_ms),
                     device::edge_routing_info.eq(edge_routing_info.clone()),
                     device::props_hash.eq(props_hash.clone()),
+                    device::server_cert_chain.eq(server_cert_chain.clone()),
                 ))
                 .on_conflict(device::id)
                 .do_update()
@@ -284,6 +294,7 @@ impl SqliteStore {
                     device::app_version_last_fetched_ms.eq(app_version_last_fetched_ms),
                     device::edge_routing_info.eq(edge_routing_info),
                     device::props_hash.eq(props_hash),
+                    device::server_cert_chain.eq(server_cert_chain),
                 ))
                 .execute(&mut conn)
                 .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -345,6 +356,7 @@ impl SqliteStore {
                     device::app_version_last_fetched_ms.eq(new_device.app_version_last_fetched_ms),
                     device::edge_routing_info.eq(None::<Vec<u8>>),
                     device::props_hash.eq(None::<String>),
+                    device::server_cert_chain.eq(None::<Vec<u8>>),
                 ))
                 .execute(&mut conn)
                 .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -426,6 +438,7 @@ impl SqliteStore {
             app_version_last_fetched_ms,
             edge_routing_info,
             props_hash,
+            server_cert_chain_blob,
         )) = row
         {
             let id = if !pn_str.is_empty() {
@@ -481,6 +494,30 @@ impl SqliteStore {
                 },
                 edge_routing_info,
                 props_hash,
+                server_cert_chain: server_cert_chain_blob
+                    .as_deref()
+                    .and_then(|bytes| {
+                        // The cert chain is a perf cache, not load-bearing
+                        // identity. A corrupt blob (truncated row, format
+                        // change between versions) must NOT block startup —
+                        // log it and degrade to None so the next connect
+                        // simply pays one XX handshake to repopulate.
+                        match bincode::serde::decode_from_slice(
+                            bytes,
+                            bincode::config::standard(),
+                        ) {
+                            Ok((chain, _)) => Some(chain),
+                            Err(e) => {
+                                log::warn!(
+                                    "device {} server_cert_chain blob ({} bytes) failed to decode: {};                                      dropping cache, next connect will use XX",
+                                    self.device_id,
+                                    bytes.len(),
+                                    e,
+                                );
+                                None
+                            }
+                        }
+                    }),
             }))
         } else {
             Ok(None)
@@ -2408,5 +2445,45 @@ mod tests {
 
         let consumed = store.consume_forget_marks(group2).await.unwrap();
         assert!(consumed.is_empty());
+    }
+
+    /// Round-trips a `CachedServerCertChain` through the SQLite schema:
+    /// create → save → load. Exercises the `2026-04-26-000000_add_server_cert_chain`
+    /// migration plus the bincode encode/decode path (oxidezap #598).
+    #[tokio::test]
+    async fn test_server_cert_chain_survives_save_load_roundtrip() {
+        let store = create_test_store().await;
+        let device_id = store.create_new_device().await.expect("create device");
+
+        let mut device = store
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after create");
+        assert!(device.server_cert_chain.is_none());
+
+        device.server_cert_chain = Some(wa_rs_core::store::CachedServerCertChain {
+            intermediate: wa_rs_core::store::CachedNoiseCert {
+                key: [0xAB; 32],
+                not_before: 1_700_000_000,
+                not_after: 1_900_000_000,
+            },
+            leaf: wa_rs_core::store::CachedNoiseCert {
+                key: [0xCD; 32],
+                not_before: 1_700_000_500,
+                not_after: 1_899_999_500,
+            },
+        });
+        store
+            .save_device_data_for_device(device_id, &device)
+            .await
+            .expect("save with cert chain");
+
+        let loaded = store
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("reload")
+            .expect("device should still exist");
+        assert_eq!(loaded.server_cert_chain, device.server_cert_chain);
     }
 }

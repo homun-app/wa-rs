@@ -69,6 +69,75 @@ fn build_base_client_payload(
     }
 }
 
+/// Override for selected `DeviceProps` fields before pairing. `None` fields
+/// preserve the current value on the device (oxidezap #586).
+#[derive(Debug, Clone, Default)]
+pub struct DevicePropsOverride {
+    pub os: Option<String>,
+    pub version: Option<wa::device_props::AppVersion>,
+    pub platform_type: Option<wa::device_props::PlatformType>,
+    pub history_sync_config: Option<wa::device_props::HistorySyncConfig>,
+}
+
+impl DevicePropsOverride {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_os(mut self, os: impl Into<String>) -> Self {
+        self.os = Some(os.into());
+        self
+    }
+
+    pub fn with_version(mut self, version: wa::device_props::AppVersion) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    pub fn with_platform_type(mut self, platform_type: wa::device_props::PlatformType) -> Self {
+        self.platform_type = Some(platform_type);
+        self
+    }
+
+    /// Replaces the entire `HistorySyncConfig`. Spread [`default_history_sync_config`]
+    /// into the literal to patch only specific fields while keeping sane defaults.
+    pub fn with_history_sync_config(
+        mut self,
+        history_sync_config: wa::device_props::HistorySyncConfig,
+    ) -> Self {
+        self.history_sync_config = Some(history_sync_config);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.os.is_none()
+            && self.version.is_none()
+            && self.platform_type.is_none()
+            && self.history_sync_config.is_none()
+    }
+}
+
+/// Default `HistorySyncConfig` aligned with WA Web's static claims
+/// (`Payload.js` in `WAWebClientPayload`). Runtime-derived fields like
+/// `storage_quota_mb`, `on_demand_ready`, and justknobx-gated flags are left
+/// unset so callers can populate them through
+/// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
+/// hardcoded values (oxidezap #586).
+pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
+    wa::device_props::HistorySyncConfig {
+        full_sync_days_limit: Some(30),
+        inline_initial_payload_in_e2_ee_msg: Some(true),
+        support_bot_user_agent_chat_history: Some(true),
+        support_cag_reactions_and_polls: Some(true),
+        support_recent_sync_chunk_message_count_tuning: Some(true),
+        support_hosted_group_msg: Some(true),
+        support_biz_hosted_msg: Some(true),
+        support_fbid_bot_chat_history: Some(true),
+        support_message_association: Some(true),
+        ..Default::default()
+    }
+}
+
 pub static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(|| wa::DeviceProps {
     os: Some("rust".to_string()),
     version: Some(wa::device_props::AppVersion {
@@ -79,12 +148,7 @@ pub static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(|| wa::DeviceProps {
     }),
     platform_type: Some(wa::device_props::PlatformType::Unknown as i32),
     require_full_sync: Some(true),
-    history_sync_config: Some(wa::device_props::HistorySyncConfig {
-        full_sync_days_limit: Some(30),
-        inline_initial_payload_in_e2_ee_msg: Some(true),
-        storage_quota_mb: Some(10240),
-        ..Default::default()
-    }),
+    history_sync_config: Some(default_history_sync_config()),
 });
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -118,6 +182,51 @@ pub struct Device {
     /// Sent on subsequent connects to enable delta updates instead of full fetches.
     #[serde(default)]
     pub props_hash: Option<String>,
+    /// Server cert chain cached from the last successful XX (or XX-fallback)
+    /// handshake. Enables Noise IK on the next connect by exposing
+    /// `leaf.key` as the server's static public key, and lets us reject
+    /// stale entries via `not_after` before even attempting IK.
+    /// `None` forces XX on the next connect (oxidezap #598).
+    #[serde(default)]
+    pub server_cert_chain: Option<CachedServerCertChain>,
+}
+
+/// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
+/// persists in `waNoiseInfo.certificateChainBuffer` (only `key` plus the
+/// validity window — signatures and issuer_serial are intentionally dropped).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedNoiseCert {
+    /// 32-byte X25519 public key from `NoiseCertificate.Details.key`.
+    pub key: [u8; 32],
+    /// Unix epoch seconds. Validation window from `NoiseCertificate.Details`.
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+/// Cached form of the server's two-cert chain. `leaf.key` is the server
+/// static public key consumed by Noise IK; the intermediate is kept solely
+/// to mirror WA Web's expiry checks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedServerCertChain {
+    pub intermediate: CachedNoiseCert,
+    pub leaf: CachedNoiseCert,
+}
+
+impl From<wa_rs_noise::VerifiedServerCertChain> for CachedServerCertChain {
+    fn from(v: wa_rs_noise::VerifiedServerCertChain) -> Self {
+        Self {
+            intermediate: CachedNoiseCert {
+                key: v.intermediate_key,
+                not_before: v.intermediate_not_before,
+                not_after: v.intermediate_not_after,
+            },
+            leaf: CachedNoiseCert {
+                key: v.leaf_key,
+                not_before: v.leaf_not_before,
+                not_after: v.leaf_not_after,
+            },
+        }
+    }
 }
 
 impl Default for Device {
@@ -169,6 +278,7 @@ impl Device {
             device_props: DEVICE_PROPS.clone(),
             edge_routing_info: None,
             props_hash: None,
+            server_cert_chain: None,
         }
     }
 
@@ -191,20 +301,24 @@ impl Device {
         self.pn.is_some() && !self.push_name.is_empty()
     }
 
-    pub fn set_device_props(
-        &mut self,
-        os: Option<String>,
-        version: Option<wa::device_props::AppVersion>,
-        platform_type: Option<wa::device_props::PlatformType>,
-    ) {
-        if let Some(os) = os {
+    /// Mirrors WA Web `WAWebUserPrefsMultiDevice.isRegistered()`:
+    /// `!!(m() && getMaybeMeDevicePn())`.
+    pub fn is_registered(&self) -> bool {
+        self.pn.is_some()
+    }
+
+    pub fn set_device_props(&mut self, o: DevicePropsOverride) {
+        if let Some(os) = o.os {
             self.device_props.os = Some(os);
         }
-        if let Some(version) = version {
+        if let Some(version) = o.version {
             self.device_props.version = Some(version);
         }
-        if let Some(platform_type) = platform_type {
+        if let Some(platform_type) = o.platform_type {
             self.device_props.platform_type = Some(platform_type as i32);
+        }
+        if let Some(history_sync_config) = o.history_sync_config {
+            self.device_props.history_sync_config = Some(history_sync_config);
         }
     }
 
@@ -284,5 +398,47 @@ mod tests {
             assert!(device.registration_id >= 1);
             assert!(device.registration_id <= 2147483647);
         }
+    }
+
+    /// Override survives the ClientPayload → bytes → DeviceProps round-trip;
+    /// `None` fields preserve the prior value (oxidezap #586).
+    #[test]
+    fn set_device_props_override_reaches_registration_payload() {
+        use prost::Message;
+        let mut device = Device::new();
+        assert!(device.pn.is_none());
+
+        device.set_device_props(
+            DevicePropsOverride::new()
+                .with_os("Android 14")
+                .with_platform_type(wa::device_props::PlatformType::Chrome),
+        );
+
+        let payload = device.get_client_payload();
+        let reg = payload
+            .device_pairing_data
+            .expect("registration payload must carry device_pairing_data");
+        let bytes = reg
+            .device_props
+            .expect("device_pairing_data must carry device_props");
+        let props = wa::DeviceProps::decode(bytes.as_slice()).expect("device_props must decode");
+
+        assert_eq!(props.os.as_deref(), Some("Android 14"));
+        assert_eq!(
+            props.platform_type,
+            Some(wa::device_props::PlatformType::Chrome as i32)
+        );
+    }
+
+    /// The static defaults now carry WA Web's HistorySyncConfig claim set.
+    #[test]
+    fn device_props_default_history_sync_config_matches_wa_web() {
+        let cfg = default_history_sync_config();
+        assert_eq!(cfg.full_sync_days_limit, Some(30));
+        assert_eq!(cfg.inline_initial_payload_in_e2_ee_msg, Some(true));
+        assert_eq!(cfg.support_message_association, Some(true));
+        assert_eq!(cfg.support_hosted_group_msg, Some(true));
+        // storage_quota_mb is runtime-derived: the static must not pin it.
+        assert_eq!(cfg.storage_quota_mb, None);
     }
 }
