@@ -11,10 +11,10 @@ use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use moka::future::Cache;
 use tokio::sync::watch;
-use wa_rs_core::xml::DisplayableNode;
 use wa_rs_binary::builder::NodeBuilder;
 use wa_rs_binary::jid::JidExt;
 use wa_rs_binary::node::{Attrs, Node};
+use wa_rs_core::xml::DisplayableNode;
 
 use crate::appstate_sync::AppStateProcessor;
 use crate::handlers::chatstate::ChatStateEvent;
@@ -45,6 +45,13 @@ use crate::sync_task::MajorSyncTask;
 
 /// Type alias for chatstate event handler functions.
 type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
+
+/// Pending IQ responses: request id -> oneshot sender (Ok = response node,
+/// Err = failed fast on connection cleanup).
+type ResponseWaiterMap = HashMap<
+    String,
+    tokio::sync::oneshot::Sender<Result<wa_rs_binary::Node, crate::request::IqError>>,
+>;
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
 
@@ -104,8 +111,9 @@ pub struct Client {
     pub(crate) transport_factory: Arc<dyn crate::transport::TransportFactory>,
     pub(crate) noise_socket: Arc<Mutex<Option<Arc<NoiseSocket>>>>,
 
-    pub(crate) response_waiters:
-        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<wa_rs_binary::Node>>>>,
+    /// Pending IQ waiters, resolved with the response node or failed fast on
+    /// connection cleanup (`Err(IqError::NotConnected)`).
+    pub(crate) response_waiters: Arc<Mutex<ResponseWaiterMap>>,
     pub(crate) unique_id: String,
     pub(crate) id_counter: Arc<AtomicU64>,
 
@@ -117,6 +125,10 @@ pub struct Client {
     /// Keys are Signal protocol address strings (e.g., "user@s.whatsapp.net:0")
     /// to match the SignalProtocolStoreAdapter's internal locking.
     pub(crate) session_locks: Cache<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Serializes sender-key chain mutations per (group, sender): group decrypt
+    /// and SKDM processing for the same sender must not race the ratchet
+    /// advance (oxidezap #992). Different groups/senders run in parallel.
+    pub(crate) sender_key_locks: Cache<String, Arc<tokio::sync::Mutex<()>>>,
 
     /// Per-chat message queues for sequential message processing.
     /// Prevents race conditions where a later message is processed before
@@ -143,6 +155,12 @@ pub struct Client {
     /// Connection generation counter - incremented on each new connection.
     /// Used to detect stale post-login tasks from previous connections.
     pub(crate) connection_generation: Arc<AtomicU64>,
+    /// Incremented on every successful `connect()`, so exactly one keepalive
+    /// loop survives rapid reconnect cycles (see `keepalive_loop`).
+    pub(crate) connect_epoch: Arc<AtomicU64>,
+    /// Dead-socket watchdog: armed on the first send after a receive, cancelled
+    /// on every receive; checked by the keepalive loop (WA Web `deadSocketTimer`).
+    pub(crate) data_watchdog: crate::keepalive::DataWatchdog,
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
     /// Uses moka cache with TTL and max capacity for automatic eviction.
@@ -169,24 +187,27 @@ pub struct Client {
 
     pub(crate) app_state_processor: OnceCell<AppStateProcessor>,
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<String, std::time::Instant>>>,
-    pub(crate) initial_keys_synced_notifier: Arc<Notify>,
-    pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
+    /// State for "at least one app state key share processed" (initial full sync).
+    /// watch channel instead of Notify+AtomicBool: no missed wakeups between
+    /// the state check and the waiter registration.
+    pub(crate) initial_app_state_keys_state: Arc<watch::Sender<bool>>,
 
-    /// Notifier for when offline sync (ib offline stanza) is received.
+    /// Offline sync state (ib offline stanza received).
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
-    pub(crate) offline_sync_notifier: Arc<Notify>,
-    /// Flag indicating offline sync has completed (received ib offline stanza).
-    pub(crate) offline_sync_completed: Arc<AtomicBool>,
+    /// watch channel instead of Notify+AtomicBool: no missed wakeups between
+    /// the state check and the waiter registration.
+    pub(crate) offline_sync_state: Arc<watch::Sender<bool>>,
     /// Metrics for granular offline sync logging
     pub(crate) offline_sync_metrics: Arc<OfflineSyncMetrics>,
     /// Metrics for tracking the effectiveness of local re-queue optimization
     pub(crate) retry_metrics: Arc<RetryMetrics>,
-    /// Notifier for when the noise socket is established (before login).
-    /// Use this to wait for the socket to be ready for sending messages.
-    pub(crate) socket_ready_notifier: Arc<Notify>,
-    /// Notifier for when the client is fully connected and logged in.
-    /// Triggered after Event::Connected is dispatched.
-    pub(crate) connected_notifier: Arc<Notify>,
+    /// State of the noise socket (before login): `true` from handshake
+    /// completion until connection cleanup. Doubles as the backing state for
+    /// `is_connected()` and `wait_for_socket`.
+    pub(crate) socket_state: Arc<watch::Sender<bool>>,
+    /// State for "fully connected and logged in". Set after Event::Connected
+    /// is dispatched; backs `wait_for_connected`.
+    pub(crate) connected_state: Arc<watch::Sender<bool>>,
     pub(crate) major_sync_task_sender: mpsc::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<watch::Sender<()>>>>,
 
@@ -282,6 +303,10 @@ impl Client {
                 .time_to_live(Duration::from_secs(300)) // 5 minute TTL
                 .max_capacity(10_000) // Limit to 10k concurrent sessions
                 .build(),
+            sender_key_locks: Cache::builder()
+                .time_to_live(Duration::from_secs(300)) // 5 minute TTL
+                .max_capacity(10_000) // Limit to 10k concurrent group/sender chains
+                .build(),
             message_queues: Cache::builder()
                 .time_to_live(Duration::from_secs(300)) // Idle queues expire after 5 mins
                 .max_capacity(10_000) // Limit to 10k concurrent chats
@@ -300,6 +325,8 @@ impl Client {
 
             expected_disconnect: Arc::new(AtomicBool::new(false)),
             connection_generation: Arc::new(AtomicU64::new(0)),
+            connect_epoch: Arc::new(AtomicU64::new(0)),
+            data_watchdog: crate::keepalive::DataWatchdog::default(),
 
             // Recent messages cache for retry functionality
             // TTL of 5 minutes (retries don't happen after that)
@@ -346,12 +373,10 @@ impl Client {
 
             app_state_processor: OnceCell::new(),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
-            initial_keys_synced_notifier: Arc::new(Notify::new()),
-            initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
-            offline_sync_notifier: Arc::new(Notify::new()),
-            offline_sync_completed: Arc::new(AtomicBool::new(false)),
-            socket_ready_notifier: Arc::new(Notify::new()),
-            connected_notifier: Arc::new(Notify::new()),
+            initial_app_state_keys_state: Arc::new(watch::Sender::new(false)),
+            offline_sync_state: Arc::new(watch::Sender::new(false)),
+            socket_state: Arc::new(watch::Sender::new(false)),
+            connected_state: Arc::new(watch::Sender::new(false)),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wa_rs_core::pair_code::PairCodeState::default())),
@@ -559,7 +584,7 @@ impl Client {
         // handle_success will properly process the <success> stanza even if
         // a previous connection's post-login task bailed out early.
         self.is_logged_in.store(false, Ordering::Relaxed);
-        self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.offline_sync_state.send_replace(false);
 
         let version_future = crate::version::resolve_and_update_version(
             &self.persistence_manager,
@@ -572,25 +597,47 @@ impl Client {
         debug!("Connecting WebSocket and fetching latest client version in parallel...");
         let (version_result, transport_result) = tokio::join!(version_future, transport_future);
 
-        version_result.map_err(|e| anyhow!("Failed to resolve app version: {}", e))?;
+        // join! runs both futures to completion, so a version failure can leave a
+        // live transport behind: disconnect it explicitly instead of just dropping.
         let (transport, mut transport_events) = transport_result?;
+        if let Err(e) = version_result {
+            transport.disconnect().await;
+            return Err(anyhow!("Failed to resolve app version: {}", e));
+        }
         debug!("Version fetch and transport connection established.");
 
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
-        let noise_socket =
-            handshake::do_handshake(&device_snapshot, transport.clone(), &mut transport_events)
-                .await?;
+        let noise_socket = match handshake::do_handshake(
+            &device_snapshot,
+            transport.clone(),
+            &mut transport_events,
+        )
+        .await
+        {
+            Ok(socket) => socket,
+            Err(e) => {
+                // Dropping the transport without closing it would leave the detached
+                // read pump holding the TCP connection until the server times out,
+                // leaking a socket per failed reconnect attempt.
+                transport.disconnect().await;
+                return Err(e.into());
+            }
+        };
 
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
         *self.noise_socket.lock().await = Some(noise_socket);
 
         // Notify waiters that socket is ready (before login)
-        self.socket_ready_notifier.notify_waiters();
+        self.socket_state.send_replace(true);
 
+        // Only the newest connection's keepalive loop keeps running: a previous
+        // loop that missed a disconnect would otherwise keep pinging the new
+        // socket, and loops accumulate over rapid reconnect cycles.
+        let epoch = self.connect_epoch.fetch_add(1, Ordering::SeqCst);
         let client_clone = self.clone();
-        tokio::spawn(async move { client_clone.keepalive_loop().await });
+        tokio::spawn(async move { client_clone.keepalive_loop(epoch).await });
 
         Ok(())
     }
@@ -612,9 +659,16 @@ impl Client {
         *self.transport.lock().await = None;
         *self.transport_events.lock().await = None;
         *self.noise_socket.lock().await = None;
+        self.socket_state.send_replace(false);
+        self.connected_state.send_replace(false);
         self.retried_group_messages.invalidate_all();
+        // Fail pending IQ waiters fast instead of leaving each to run out its
+        // full timeout: callers can retry on the next connection.
+        for (_, waiter) in self.response_waiters.lock().await.drain() {
+            let _ = waiter.send(Err(crate::request::IqError::NotConnected));
+        }
         // Reset offline sync state for next connection
-        self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.offline_sync_state.send_replace(false);
     }
 
     async fn read_messages_loop(self: &Arc<Self>) -> Result<(), anyhow::Error> {
@@ -639,6 +693,9 @@ impl Client {
                     event_result = transport_events.recv() => {
                         match event_result {
                             Ok(crate::transport::TransportEvent::DataReceived(data)) => {
+                                // Any received frame proves the socket is alive:
+                                // cancel the dead-socket watchdog.
+                                self.data_watchdog.on_receive();
                                 // Feed data into the frame decoder
                                 frame_decoder.feed(&data);
 
@@ -1152,16 +1209,19 @@ impl Client {
             // (e.g., during initial pairing or if there are no offline messages).
             const OFFLINE_SYNC_TIMEOUT_SECS: u64 = 5;
 
-            if !client_clone.offline_sync_completed.load(Ordering::Relaxed) {
+            if !*client_clone.offline_sync_state.borrow() {
                 debug!(
                     "Waiting for offline sync to complete (up to {}s)...",
                     OFFLINE_SYNC_TIMEOUT_SECS
                 );
-                let wait_result = tokio::time::timeout(
-                    Duration::from_secs(OFFLINE_SYNC_TIMEOUT_SECS),
-                    client_clone.offline_sync_notifier.notified(),
-                )
-                .await;
+                let mut offline_rx = client_clone.offline_sync_state.subscribe();
+                let wait_result =
+                    tokio::time::timeout(Duration::from_secs(OFFLINE_SYNC_TIMEOUT_SECS), async {
+                        while !*offline_rx.borrow_and_update() {
+                            let _ = offline_rx.changed().await;
+                        }
+                    })
+                    .await;
 
                 // Check if connection was replaced while waiting
                 check_generation!();
@@ -1245,7 +1305,7 @@ impl Client {
                 .core
                 .event_bus
                 .dispatch(&Event::Connected(crate::types::events::Connected));
-            client_clone.connected_notifier.notify_waiters();
+            client_clone.connected_state.send_replace(true);
 
             check_generation!();
 
@@ -1256,18 +1316,17 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
-                if !client_clone
-                    .initial_app_state_keys_received
-                    .load(Ordering::Relaxed)
-                {
+                if !*client_clone.initial_app_state_keys_state.borrow() {
                     debug!(
                         target: "Client/AppState",
                         "Waiting up to 5s for app state keys..."
                     );
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        client_clone.initial_keys_synced_notifier.notified(),
-                    )
+                    let mut keys_rx = client_clone.initial_app_state_keys_state.subscribe();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        while !*keys_rx.borrow_and_update() {
+                            let _ = keys_rx.changed().await;
+                        }
+                    })
                     .await;
 
                     // Check if connection was replaced while waiting
@@ -1317,7 +1376,7 @@ impl Client {
         if let Some(id) = id_opt
             && let Some(waiter) = self.response_waiters.lock().await.remove(&id)
         {
-            if waiter.send(node).is_err() {
+            if waiter.send(Ok(node)).is_err() {
                 warn!(target: "Client/Ack", "Failed to send ACK response to waiter for ID {id}. Receiver was likely dropped.");
             }
             return true;
@@ -1335,12 +1394,14 @@ impl Client {
                 Err(e) => {
                     let es = e.to_string();
                     if es.contains("app state key not found") && attempt == 1 {
-                        if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
+                        if !*self.initial_app_state_keys_state.borrow() {
                             debug!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
-                            if tokio::time::timeout(
-                                Duration::from_secs(10),
-                                self.initial_keys_synced_notifier.notified(),
-                            )
+                            let mut keys_rx = self.initial_app_state_keys_state.subscribe();
+                            if tokio::time::timeout(Duration::from_secs(10), async {
+                                while !*keys_rx.borrow_and_update() {
+                                    let _ = keys_rx.changed().await;
+                                }
+                            })
                             .await
                             .is_err()
                             {
@@ -1872,9 +1933,10 @@ impl Client {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.noise_socket
-            .try_lock()
-            .is_ok_and(|guard| guard.is_some())
+        // Backed by a watch channel set in connect()/cleanup_connection_state():
+        // unlike the previous noise_socket.try_lock() probe, this cannot return
+        // false just because another task currently holds the socket mutex.
+        *self.socket_state.borrow()
     }
 
     pub fn is_logged_in(&self) -> bool {
@@ -1901,6 +1963,31 @@ impl Client {
         }
     }
 
+    /// Waits until the watch channel holds `true`, or times out.
+    ///
+    /// Subscribing snapshots the current value, so a transition that happens
+    /// between the caller's own check and this wait is never missed (the
+    /// failure mode of `Notify::notify_waiters`, which stores no permit).
+    async fn wait_for_state(
+        channel: &watch::Sender<bool>,
+        timeout: std::time::Duration,
+        what: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut rx = channel.subscribe();
+        if *rx.borrow_and_update() {
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, async {
+            while !*rx.borrow_and_update() {
+                rx.changed().await?;
+            }
+            Ok::<(), tokio::sync::watch::error::RecvError>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for {}", what))?
+        .map_err(|e| anyhow::anyhow!("Watch channel closed while waiting for {}: {}", what, e))
+    }
+
     /// Waits for the noise socket to be established.
     ///
     /// Returns `Ok(())` when the socket is ready, or `Err` on timeout.
@@ -1909,21 +1996,7 @@ impl Client {
     ///
     /// If the socket is already connected, returns immediately.
     pub async fn wait_for_socket(&self, timeout: std::time::Duration) -> Result<(), anyhow::Error> {
-        // Fast path: already connected
-        if self.is_connected() {
-            return Ok(());
-        }
-
-        // Register waiter and re-check to avoid race condition:
-        // If socket becomes ready between checks, the notified future captures it.
-        let notified = self.socket_ready_notifier.notified();
-        if self.is_connected() {
-            return Ok(());
-        }
-
-        tokio::time::timeout(timeout, notified)
-            .await
-            .map_err(|_| anyhow::anyhow!("Timeout waiting for socket"))
+        Self::wait_for_state(&self.socket_state, timeout, "socket").await
     }
 
     /// Waits for the client to establish a connection and complete login.
@@ -1937,21 +2010,7 @@ impl Client {
         &self,
         timeout: std::time::Duration,
     ) -> Result<(), anyhow::Error> {
-        // Fast path: already connected and logged in
-        if self.is_connected() && self.is_logged_in() {
-            return Ok(());
-        }
-
-        // Register waiter and re-check to avoid race condition:
-        // If connection completes between checks, the notified future captures it.
-        let notified = self.connected_notifier.notified();
-        if self.is_connected() && self.is_logged_in() {
-            return Ok(());
-        }
-
-        tokio::time::timeout(timeout, notified)
-            .await
-            .map_err(|_| anyhow::anyhow!("Timeout waiting for connection"))
+        Self::wait_for_state(&self.connected_state, timeout, "connection").await
     }
 
     /// Get access to the PersistenceManager for this client.
@@ -2037,6 +2096,12 @@ impl Client {
 
         // Size based on plaintext + encryption overhead (16 byte tag + 3 byte frame header)
         let encrypted_buf = Vec::with_capacity(plaintext_buf.len() + 32);
+
+        // Arm the dead-socket watchdog BEFORE the write: a wedged write (socket
+        // established but no longer draining) never returns to arm it after,
+        // and the watchdog is what eventually tears the connection down
+        // (oxidezap #1547). Arming is idempotent per send.
+        self.data_watchdog.on_send();
 
         let (plaintext_buf, _) = match noise_socket
             .encrypt_and_send(plaintext_buf, encrypted_buf)
@@ -2308,13 +2373,14 @@ mod tests {
 
         // 4. Await the receiver with a timeout
         match tokio::time::timeout(Duration::from_secs(1), rx).await {
-            Ok(Ok(response_node)) => {
+            Ok(Ok(Ok(response_node))) => {
                 assert_eq!(
                     response_node.attrs.get("id").and_then(|v| v.as_str()),
                     Some(test_id.as_str()),
                     "Response node should have correct ID"
                 );
             }
+            Ok(Ok(Err(e))) => panic!("Waiter resolved with error: {e:?}"),
             Ok(Err(_)) => panic!("Receiver was dropped without being sent a value"),
             Err(_) => panic!("Test timed out waiting for ack response"),
         }
@@ -2327,6 +2393,48 @@ mod tests {
 
         info!(
             "✅ test_ack_waiter_resolves passed: ACK response correctly resolves pending waiters"
+        );
+    }
+
+    /// Pending IQ waiters must fail fast on connection cleanup instead of
+    /// hanging until their full timeout (ported from oxidezap's reconnect
+    /// abort behavior).
+    #[tokio::test]
+    async fn test_cleanup_fails_pending_waiters() {
+        let backend = Arc::new(
+            crate::store::SqliteStore::new("file:memdb_waiter_cleanup?mode=memory&cache=shared")
+                .await
+                .expect("Failed to create in-memory backend for test"),
+        );
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _rx) = Client::new(
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        let (tx, mut waiter_rx) = tokio::sync::oneshot::channel();
+        client
+            .response_waiters
+            .lock()
+            .await
+            .insert("pending-iq-1".to_string(), tx);
+
+        client.cleanup_connection_state().await;
+
+        match tokio::time::timeout(Duration::from_secs(1), &mut waiter_rx).await {
+            Ok(Ok(Err(crate::request::IqError::NotConnected))) => {}
+            other => panic!("expected fast Err(NotConnected) for pending waiter, got {other:?}"),
+        }
+        assert!(
+            client.response_waiters.lock().await.is_empty(),
+            "waiter map must be drained"
         );
     }
 
@@ -2605,9 +2713,7 @@ mod tests {
         .await;
 
         // Set the flag to true (simulating offline sync completed)
-        client
-            .offline_sync_completed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        client.offline_sync_state.send_replace(true);
 
         // This should return immediately (not wait 10 seconds)
         let start = std::time::Instant::now();
@@ -2702,7 +2808,7 @@ mod tests {
         // Spawn a task that will notify after 50ms
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            client_clone.offline_sync_notifier.notify_waiters();
+            client_clone.offline_sync_state.send_replace(true);
         });
 
         let start = std::time::Instant::now();
@@ -2724,7 +2830,7 @@ mod tests {
         info!("✅ test_wait_for_offline_delivery_end_returns_on_notify passed");
     }
 
-    /// Test that the offline_sync_completed flag starts as false.
+    /// Test that the offline_sync_state flag starts as false.
     #[tokio::test]
     async fn test_offline_sync_flag_initially_false() {
         let backend = Arc::new(
@@ -2749,10 +2855,8 @@ mod tests {
 
         // The flag should be false initially
         assert!(
-            !client
-                .offline_sync_completed
-                .load(std::sync::atomic::Ordering::Relaxed),
-            "offline_sync_completed should be false when Client is first created"
+            !*client.offline_sync_state.borrow(),
+            "offline_sync_state should be false when Client is first created"
         );
 
         info!("✅ test_offline_sync_flag_initially_false passed");
@@ -2764,8 +2868,6 @@ mod tests {
     /// 3. Notify is called
     #[tokio::test]
     async fn test_offline_sync_lifecycle() {
-        use std::sync::atomic::Ordering;
-
         let backend = Arc::new(
             crate::store::SqliteStore::new("file:memdb_offline_lifecycle?mode=memory&cache=shared")
                 .await
@@ -2785,7 +2887,7 @@ mod tests {
         .await;
 
         // 1. Initially false
-        assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
+        assert!(!*client.offline_sync_state.borrow());
 
         // 2. Spawn a waiter
         let client_waiter = client.clone();
@@ -2804,8 +2906,7 @@ mod tests {
         );
 
         // 3. Simulate IB handler behavior (set flag and notify)
-        client.offline_sync_completed.store(true, Ordering::Relaxed);
-        client.offline_sync_notifier.notify_waiters();
+        client.offline_sync_state.send_replace(true);
 
         // 4. Waiter should complete
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiter_handle)
@@ -2814,7 +2915,7 @@ mod tests {
             .expect("Waiter task should not panic");
 
         assert!(result, "Waiter should have completed successfully");
-        assert!(client.offline_sync_completed.load(Ordering::Relaxed));
+        assert!(*client.offline_sync_state.borrow());
 
         info!("✅ test_offline_sync_lifecycle passed");
     }
@@ -2864,7 +2965,6 @@ mod tests {
     /// establish_primary_phone_session_immediate.
     #[tokio::test]
     async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
-        use std::sync::atomic::Ordering;
         use wa_rs_binary::jid::Jid;
 
         let backend = Arc::new(
@@ -2886,7 +2986,7 @@ mod tests {
         .await;
 
         // Flag is false (offline sync not complete)
-        assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
+        assert!(!*client.offline_sync_state.borrow());
 
         // Call ensure_e2e_sessions with an empty list (so it returns early after the wait)
         // This lets us test the waiting behavior without needing network
@@ -2924,8 +3024,7 @@ mod tests {
         );
 
         // Now complete offline sync
-        client.offline_sync_completed.store(true, Ordering::Relaxed);
-        client.offline_sync_notifier.notify_waiters();
+        client.offline_sync_state.send_replace(true);
 
         // Now it should complete (might fail on session establishment, but that's ok)
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), ensure_handle).await;
@@ -2948,7 +3047,6 @@ mod tests {
     /// 4. When decryption fails, PDO can immediately send to device 0
     #[tokio::test]
     async fn test_immediate_session_does_not_wait_for_offline_sync() {
-        use std::sync::atomic::Ordering;
         use wa_rs_binary::jid::Jid;
 
         let backend = Arc::new(
@@ -2977,7 +3075,7 @@ mod tests {
         .await;
 
         // Flag is false (offline sync not complete - simulating login state)
-        assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
+        assert!(!*client.offline_sync_state.borrow());
 
         // Call establish_primary_phone_session_immediate
         // It should NOT wait for offline sync - it should proceed immediately
@@ -3026,10 +3124,10 @@ mod tests {
     /// - RESULT: Remote device still uses old session state, causing MAC failures
     #[tokio::test]
     async fn test_establish_session_skips_when_exists() {
+        use wa_rs_binary::jid::Jid;
         use wa_rs_core::libsignal::protocol::SessionRecord;
         use wa_rs_core::libsignal::store::SessionStore;
         use wa_rs_core::types::jid::JidExt;
-        use wa_rs_binary::jid::Jid;
 
         let backend = Arc::new(
             crate::store::SqliteStore::new("file:memdb_skip_existing?mode=memory&cache=shared")

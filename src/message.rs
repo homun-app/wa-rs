@@ -8,6 +8,9 @@ use prost::Message as ProtoMessage;
 use rand::TryRngCore;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use wa_rs_binary::jid::Jid;
+use wa_rs_binary::jid::JidExt as _;
+use wa_rs_binary::node::Node;
 use wa_rs_core::libsignal::crypto::DecryptionError;
 use wa_rs_core::libsignal::protocol::SenderKeyDistributionMessage;
 use wa_rs_core::libsignal::protocol::group_decrypt;
@@ -21,9 +24,6 @@ use wa_rs_core::libsignal::protocol::{
 use wa_rs_core::libsignal::store::sender_key_name::SenderKeyName;
 use wa_rs_core::messages::MessageUtils;
 use wa_rs_core::types::jid::JidExt;
-use wa_rs_binary::jid::Jid;
-use wa_rs_binary::jid::JidExt as _;
-use wa_rs_binary::node::Node;
 use wa_rs_proto::whatsapp::{self as wa};
 
 /// Maximum retry attempts per message (matches WhatsApp Web's MAX_RETRY = 5).
@@ -979,6 +979,24 @@ impl Client {
         (any_success, any_duplicate, dispatched_undecryptable)
     }
 
+    /// Per-(group, sender) lock serializing sender-key chain mutations: group
+    /// decrypt and SKDM processing for the same sender (oxidezap #992).
+    async fn sender_key_chain_lock(
+        &self,
+        sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.sender_key_locks
+            .get_with(
+                format!(
+                    "{}||{}",
+                    sender_key_name.group_id(),
+                    sender_key_name.sender_id()
+                ),
+                async { std::sync::Arc::new(tokio::sync::Mutex::new(())) },
+            )
+            .await
+    }
+
     async fn process_group_enc_batch(
         self: Arc<Self>,
         enc_nodes: &[&wa_rs_binary::node::Node],
@@ -988,7 +1006,6 @@ impl Client {
         if enc_nodes.is_empty() {
             return Ok(false);
         }
-        let device_arc = self.persistence_manager.get_device_arc().await;
 
         for enc_node in enc_nodes {
             let ciphertext: &[u8] = match &enc_node.content {
@@ -1015,9 +1032,20 @@ impl Client {
                 info.source.sender
             );
 
+            // Serialize the sender-key chain per (group, sender) instead of holding
+            // the global device write lock across the whole decrypt: two workers
+            // for the same chat can coexist after a queue-cache eviction, and
+            // without this lock they would race the ratchet advance and drop a
+            // chain step, leaving later skmsg undecryptable until the sender
+            // rotates an SKDM (oxidezap #992). The adapter takes the device lock
+            // only for its storage ops, so different groups decrypt in parallel.
+            let chain_lock = self.sender_key_chain_lock(&sender_key_name).await;
             let decrypt_result = {
-                let mut device_guard = device_arc.write().await;
-                group_decrypt(ciphertext, &mut *device_guard, &sender_key_name).await
+                let _chain_guard = chain_lock.lock().await;
+                let mut adapter = SignalProtocolStoreAdapter::new(
+                    self.persistence_manager.get_device_arc().await,
+                );
+                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await
             };
 
             match decrypt_result {
@@ -1378,13 +1406,17 @@ impl Client {
         }
 
         // Notify any waiters (initial full sync) that at least one key share was processed.
-        if stored_count > 0
-            && !self
-                .initial_app_state_keys_received
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            // First time setting; notify any waiters
-            self.initial_keys_synced_notifier.notify_waiters();
+        // send_if_modified keeps the "first time only" semantics of the old swap.
+        if stored_count > 0 {
+            self.initial_app_state_keys_state
+                .send_if_modified(|received| {
+                    if *received {
+                        false
+                    } else {
+                        *received = true;
+                        true
+                    }
+                });
         }
     }
 
@@ -1469,16 +1501,24 @@ impl Client {
             },
         };
 
-        let device_arc = self.persistence_manager.get_device_arc().await;
-        let mut device_guard = device_arc.write().await;
-
+        // SKDM processing mutates the same sender-key record as group decrypt:
+        // hold the same per-(group, sender) chain lock so the two can't race.
         let sender_address = sender_jid.to_protocol_address();
 
         let sender_key_name = SenderKeyName::new(group_jid.to_string(), sender_address.to_string());
 
-        if let Err(e) =
-            process_sender_key_distribution_message(&sender_key_name, &skdm, &mut *device_guard)
-                .await
+        let chain_lock = self.sender_key_chain_lock(&sender_key_name).await;
+        let _chain_guard = chain_lock.lock().await;
+
+        let mut adapter =
+            SignalProtocolStoreAdapter::new(self.persistence_manager.get_device_arc().await);
+
+        if let Err(e) = process_sender_key_distribution_message(
+            &sender_key_name,
+            &skdm,
+            &mut adapter.sender_key_store,
+        )
+        .await
         {
             log::error!(
                 "Failed to process SenderKeyDistributionMessage from {}: {:?}",
@@ -1972,8 +2012,8 @@ mod tests {
     /// - device_id is always 0
     #[test]
     fn test_lid_protocol_address_consistency() {
-        use wa_rs_core::types::jid::JidExt as CoreJidExt;
         use wa_rs_binary::jid::Jid;
+        use wa_rs_core::types::jid::JidExt as CoreJidExt;
 
         // Format: (jid_str, expected_name, expected_device_id, expected_to_string)
         let test_cases = vec![
@@ -2129,9 +2169,9 @@ mod tests {
     #[test]
     fn test_lid_to_phone_mapping_for_device_queries() {
         use std::collections::HashMap;
+        use wa_rs_binary::jid::Jid;
         use wa_rs_core::client::context::GroupInfo;
         use wa_rs_core::types::message::AddressingMode;
-        use wa_rs_binary::jid::Jid;
 
         // Simulate a LID group with phone number mappings
         let mut lid_to_pn_map = HashMap::new();
@@ -2197,9 +2237,9 @@ mod tests {
     #[test]
     fn test_mixed_lid_and_phone_participants() {
         use std::collections::HashMap;
+        use wa_rs_binary::jid::Jid;
         use wa_rs_core::client::context::GroupInfo;
         use wa_rs_core::types::message::AddressingMode;
-        use wa_rs_binary::jid::Jid;
 
         let mut lid_to_pn_map = HashMap::new();
         lid_to_pn_map.insert(
@@ -2284,7 +2324,9 @@ mod tests {
     async fn test_sender_key_always_uses_display_jid() {
         use crate::store::SqliteStore;
         use std::sync::Arc;
-        use wa_rs_core::libsignal::protocol::{SenderKeyStore, create_sender_key_distribution_message};
+        use wa_rs_core::libsignal::protocol::{
+            SenderKeyStore, create_sender_key_distribution_message,
+        };
         use wa_rs_core::libsignal::store::sender_key_name::SenderKeyName;
 
         let backend = Arc::new(
@@ -2372,11 +2414,11 @@ mod tests {
     async fn test_second_message_with_only_skmsg_decrypts() {
         use crate::store::SqliteStore;
         use std::sync::Arc;
+        use wa_rs_binary::builder::NodeBuilder;
         use wa_rs_core::libsignal::protocol::{
             create_sender_key_distribution_message, process_sender_key_distribution_message,
         };
         use wa_rs_core::libsignal::store::sender_key_name::SenderKeyName;
-        use wa_rs_binary::builder::NodeBuilder;
 
         let backend = Arc::new(
             SqliteStore::new("file:memdb_second_msg_test?mode=memory&cache=shared")

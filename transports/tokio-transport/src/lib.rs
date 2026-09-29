@@ -233,7 +233,18 @@ impl TransportFactory for TokioWebSocketTransportFactory {
 /// No framing logic here - just passes bytes through.
 async fn read_pump(mut stream: WsStream, event_tx: async_channel::Sender<TransportEvent>) {
     loop {
-        match stream.next().await {
+        // Also wake up when the receiver is dropped while no data is flowing:
+        // otherwise this task stays parked on the read and keeps the TCP
+        // connection alive after the caller abandoned a failed handshake.
+        let msg = tokio::select! {
+            biased;
+            _ = event_tx.closed() => {
+                debug!("Event receiver dropped, closing read pump");
+                break;
+            }
+            msg = stream.next() => msg,
+        };
+        match msg {
             Some(Ok(msg)) => {
                 if msg.is_binary() {
                     let payload = msg.into_payload();

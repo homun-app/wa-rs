@@ -140,21 +140,33 @@ impl Client {
         let request_utils = self.get_request_utils();
         let node = request_utils.build_iq_node(&query, Some(req_id.clone()));
 
-        if let Err(e) = self.send_node(node).await {
-            self.response_waiters.lock().await.remove(&req_id);
-            return match e {
-                crate::client::ClientError::Socket(s_err) => Err(IqError::Socket(s_err)),
-                crate::client::ClientError::NotConnected => Err(IqError::NotConnected),
-                _ => Err(IqError::Socket(SocketError::Crypto(e.to_string()))),
-            };
-        }
+        // The deadline covers the send as well as the answer. A write into a
+        // socket that stays established but no longer drains (host resumed
+        // from suspend, route changed underneath it) never completes and never
+        // errors; a deadline that only started after the write left every IQ —
+        // keepalive pings included — waiting forever, and the dead-socket
+        // watchdog with it (oxidezap #1547). Dropping the exchange mid-send is
+        // safe: the waiter is deregistered on every exit below.
+        let exchange = async {
+            if let Err(e) = self.send_node(node).await {
+                return Err(match e {
+                    crate::client::ClientError::Socket(s_err) => IqError::Socket(s_err),
+                    crate::client::ClientError::NotConnected => IqError::NotConnected,
+                    _ => IqError::Socket(SocketError::Crypto(e.to_string())),
+                });
+            }
+            rx.await.map_err(|_| IqError::InternalChannelClosed)?
+        };
 
-        match timeout(query.timeout.unwrap_or(default_timeout), rx).await {
+        match timeout(query.timeout.unwrap_or(default_timeout), exchange).await {
             Ok(Ok(response_node)) => match *request_utils.parse_iq_response(&response_node) {
                 Ok(()) => Ok(response_node),
                 Err(e) => Err(e.into()),
             },
-            Ok(Err(_)) => Err(IqError::InternalChannelClosed),
+            Ok(Err(e)) => {
+                self.response_waiters.lock().await.remove(&req_id);
+                Err(e)
+            }
             Err(_) => {
                 self.response_waiters.lock().await.remove(&req_id);
                 Err(IqError::Timeout)
@@ -196,7 +208,7 @@ impl Client {
             if let Some(waiter) = waiter {
                 // Try to unwrap the Arc, or clone if there are other references
                 let owned_node = Arc::try_unwrap(node).unwrap_or_else(|arc| (*arc).clone());
-                if waiter.send(owned_node).is_err() {
+                if waiter.send(Ok(owned_node)).is_err() {
                     warn!(target: "Client/IQ", "Failed to send IQ response to waiter for ID {id}. Receiver was likely dropped.");
                 }
                 return true;

@@ -1,26 +1,26 @@
 //! E2E Session management for Client.
 
 use anyhow::Result;
+use wa_rs_binary::jid::Jid;
 use wa_rs_core::libsignal::store::SessionStore;
 use wa_rs_core::types::jid::JidExt;
-use wa_rs_binary::jid::Jid;
 
 use super::Client;
 
 impl Client {
     /// Wait for offline message delivery to complete (with timeout).
     pub(crate) async fn wait_for_offline_delivery_end(&self) {
-        use std::sync::atomic::Ordering;
-
-        if self.offline_sync_completed.load(Ordering::Relaxed) {
+        let mut rx = self.offline_sync_state.subscribe();
+        if *rx.borrow_and_update() {
             return;
         }
 
         const TIMEOUT_SECS: u64 = 10;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(TIMEOUT_SECS),
-            self.offline_sync_notifier.notified(),
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), async {
+            while !*rx.borrow_and_update() {
+                let _ = rx.changed().await;
+            }
+        })
         .await;
     }
 

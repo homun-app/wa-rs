@@ -4,7 +4,6 @@ use crate::types::events::{Event, OfflineSyncCompleted, OfflineSyncPreview};
 use async_trait::async_trait;
 use log::{debug, warn};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use wa_rs_binary::node::{Node, NodeContent};
 
 /// Handler for `<ib>` (information broadcast) stanzas.
@@ -119,8 +118,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &Node) {
 
                 // Signal that offline sync is complete - post-login tasks are waiting for this.
                 // This mimics WhatsApp Web's offlineDeliveryEnd event.
-                client.offline_sync_completed.store(true, Ordering::Relaxed);
-                client.offline_sync_notifier.notify_waiters();
+                client.offline_sync_state.send_replace(true);
 
                 // NOTE: Session with primary phone (device 0) is established on login
                 // BEFORE offline messages arrive (see client.rs post-login task).
