@@ -50,6 +50,7 @@ struct AppState {
     lid: RwLock<Option<String>>,
     self_chat_peer: RwLock<Option<String>>,
     pending_own: RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    recent_self: RwLock<Vec<(String, std::time::Instant)>>,
     connected: RwLock<bool>,
     logged_out: RwLock<bool>,
     last_error: RwLock<Option<String>>,
@@ -69,6 +70,7 @@ impl AppState {
             lid: RwLock::new(None),
             self_chat_peer: RwLock::new(None),
             pending_own: RwLock::new(std::collections::HashMap::new()),
+            recent_self: RwLock::new(Vec::new()),
             connected: RwLock::new(false),
             logged_out: RwLock::new(false),
             last_error: RwLock::new(None),
@@ -412,50 +414,6 @@ async fn main() {
 
 async fn handle_message(state: &Arc<AppState>, ctx: MessageContext) {
     let info = &ctx.info;
-    let text_len = ctx.message.text_content().map(|t| t.len());
-    log::info!(
-        "inbound message: chat={} sender={} is_from_me={} is_group={} text_len={:?}",
-        info.source.chat, info.source.sender, info.source.is_from_me, info.source.is_group, text_len
-    );
-    // Own outbound traffic is remembered, not forwarded: in the self-chat
-    // ("message yourself") WhatsApp echoes the note back through a system
-    // companion JID as ordinary inbound traffic, and that echo is the copy
-    // the engine should answer.
-    if info.source.is_from_me {
-        if let Some(text) = ctx.message.text_content() {
-            state
-                .pending_own
-                .write()
-                .await
-                .insert(info.source.chat.to_string(), (text.to_string(), std::time::Instant::now()));
-        }
-        log::info!("dropped own message outside the self-chat echo path");
-        return;
-    }
-    let sender = info.source.sender.to_string();
-    let chat_key = info.source.chat.to_string();
-    let mut self_echo = *state.self_chat_peer.read().await == Some(sender.clone());
-    if !self_echo {
-        // Discovery: an inbound copy of the account's own recent note in the
-        // same chat identifies the self-chat companion JID. Once learned it is
-        // persisted and later echoes match by sender alone.
-        let mut pending = state.pending_own.write().await;
-        let matched = pending
-            .get(&chat_key)
-            .map(|(text, at)| {
-                text_matches(text, &ctx.message) && at.elapsed() < std::time::Duration::from_secs(30)
-            })
-            .unwrap_or(false);
-        if matched {
-            pending.remove(&chat_key);
-            *state.self_chat_peer.write().await = Some(sender.clone());
-            let jid = state.jid.read().await.clone();
-            let lid = state.lid.read().await.clone();
-            persist_identity(&state.db_path, jid.as_deref().unwrap_or(""), lid.as_deref().unwrap_or(""), Some(&sender));
-            log::info!("learned self-chat companion {sender}");
-            self_echo = true;
-        }
-    }
     let Some(text) = ctx.message.text_content() else {
         log::info!("dropped message without text content");
         return; // v1 bridges text messages only.
@@ -464,13 +422,82 @@ async fn handle_message(state: &Arc<AppState>, ctx: MessageContext) {
         log::info!("dropped empty message");
         return;
     }
-    let owner_jid = state.jid.read().await.clone();
-    let owner_lid = state.lid.read().await.clone();
+    let chat = info.source.chat.to_string();
+    let sender = info.source.sender.to_string();
+    let jid = state.jid.read().await.clone();
+    let lid = state.lid.read().await.clone();
+    let bare = |s: &str| s.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+    let own_users: Vec<String> = [jid.clone(), lid.clone()]
+        .into_iter()
+        .flatten()
+        .map(|full| bare(&full))
+        .filter(|u| !u.is_empty())
+        .collect();
+    let chat_bare = bare(&chat);
+
+    // Self-notes reach linked devices in two shapes: delivered directly to
+    // the account's own chat (is_from_me), or echoed by the self-chat
+    // companion as ordinary inbound traffic. Both must produce exactly one
+    // engine turn.
+    let mut self_note = false;
+    if info.source.is_from_me {
+        if own_users.contains(&chat_bare) {
+            self_note = true;
+        } else {
+            // Own message to someone else: remember it only as the seed for
+            // companion-echo discovery, never as engine input.
+            state
+                .pending_own
+                .write()
+                .await
+                .insert(chat.clone(), (text.to_string(), std::time::Instant::now()));
+            log::info!("dropped own message outside the self-chat");
+            return;
+        }
+    } else {
+        let peer = state.self_chat_peer.read().await.clone();
+        let from_peer = peer.as_deref().map(|p| bare(p) == bare(&sender)).unwrap_or(false);
+        if from_peer {
+            self_note = true;
+        } else {
+            let mut pending = state.pending_own.write().await;
+            let matched = pending
+                .get(&chat)
+                .map(|(t, at)| t == &text && at.elapsed() < std::time::Duration::from_secs(30))
+                .unwrap_or(false);
+            if matched {
+                pending.remove(&chat);
+                drop(pending);
+                *state.self_chat_peer.write().await = Some(sender.clone());
+                persist_identity(
+                    &state.db_path,
+                    jid.as_deref().unwrap_or(""),
+                    lid.as_deref().unwrap_or(""),
+                    Some(&sender),
+                );
+                log::info!("learned self-chat companion {sender}");
+                self_note = true;
+            }
+        }
+    }
+
+    if self_note {
+        // The direct copy and the companion echo can both arrive: forward the
+        // first, drop its duplicate.
+        let mut recent = state.recent_self.write().await;
+        if recent.iter().any(|(t, at)| t == &text && at.elapsed() < std::time::Duration::from_secs(25)) {
+            log::info!("dropped duplicate self-note copy");
+            return;
+        }
+        recent.push((text.to_string(), std::time::Instant::now()));
+        recent.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(60));
+    }
+
     let mut body = json!({
         "source": "wa-rs-bridge",
         "message": {
             "id": info.id.clone(),
-            "chat": chat_key,
+            "chat": chat,
             "sender": sender,
             "push_name": info.push_name.clone(),
             "is_group": info.source.is_group,
@@ -478,18 +505,16 @@ async fn handle_message(state: &Arc<AppState>, ctx: MessageContext) {
             "timestamp": info.timestamp.to_rfc3339(),
         }
     });
-    if self_echo {
-        // Attribute the echo to the account owner so the engine's
+    if self_note {
+        // Attribute self-notes to the account owner so the engine's
         // authorization gate and conversation identity see the human.
         if let Some(obj) = body.get_mut("message").and_then(Value::as_object_mut) {
             obj.insert("self_echo".into(), json!(true));
-            obj.insert("owner".into(), json!({"jid": owner_jid, "lid": owner_lid}));
+            obj.insert("owner".into(), json!({"jid": jid, "lid": lid}));
         }
     }
-    log::info!("forwarding message to engine callback ({} bytes, self_echo={self_echo})", text.len());
+    log::info!("forwarding message to engine callback (self_note={self_note})");
     push_callback(&state.callback, body).await;
 }
 
-fn text_matches(pending: &str, message: &wa::Message) -> bool {
-    message.text_content().as_deref() == Some(pending)
-}
+
