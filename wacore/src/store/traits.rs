@@ -116,6 +116,14 @@ pub trait SignalStore: Send + Sync {
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
 
+    /// Get the highest stored pre-key ID, if any.
+    ///
+    /// Used to allocate new pre-key IDs without colliding with existing keys.
+    /// Consumed one-time pre-keys are removed, so stored IDs are not contiguous:
+    /// implementations must return the true maximum, not the last ID before the
+    /// first gap.
+    async fn max_prekey_id(&self) -> Result<Option<u32>>;
+
     // --- Signed PreKey Operations ---
 
     /// Store a signed pre-key.

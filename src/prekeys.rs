@@ -6,12 +6,10 @@ use crate::client::Client;
 use anyhow;
 use log;
 use rand::TryRngCore;
+use wa_rs_binary::jid::Jid;
 use wa_rs_core::iq::prekeys::{PreKeyCountSpec, PreKeyFetchSpec, PreKeyUploadSpec};
 use wa_rs_core::libsignal::protocol::{KeyPair, PreKeyBundle, PublicKey};
 use wa_rs_core::libsignal::store::record_helpers::new_pre_key_record;
-use wa_rs_binary::jid::Jid;
-
-pub use wa_rs_core::prekeys::PreKeyUtils;
 
 const WANTED_PRE_KEY_COUNT: usize = 50;
 const MIN_PRE_KEY_COUNT: usize = 5;
@@ -44,7 +42,6 @@ impl Client {
 
     /// Ensure the server has at least MIN_PRE_KEY_COUNT pre-keys, and upload a batch of
     /// WANTED_PRE_KEY_COUNT pre-keys when it is below the threshold.
-    /// Uses intelligent pre-key management to reuse existing unuploaded keys before generating new ones.
     pub(crate) async fn upload_pre_keys(&self) -> Result<(), anyhow::Error> {
         let server_count = match self.get_server_pre_key_count().await {
             Ok(c) => c,
@@ -69,46 +66,17 @@ impl Client {
             device_guard.backend.clone()
         };
 
-        // Step 1: Try to get existing unuploaded keys from storage
         let mut keys_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
         let mut key_pairs_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
 
-        // Check if we have existing unuploaded keys by trying IDs sequentially
-        // We'll check a reasonable range to find existing keys
-        let found_count = 0;
-        for id in 1..=1000u32 {
-            if found_count >= WANTED_PRE_KEY_COUNT {
-                break;
-            }
-
-            if let Ok(Some(_record)) = backend.load_prekey(id).await {
-                // Check if this key was already uploaded by seeing if it exists on server
-                // For simplicity, assume unuploaded keys have a specific pattern or we track separately
-                // For now, we'll use existing keys if available but generate new ones with sequential IDs
-                break; // We'll generate new ones with better tracking
-            }
-        }
-
-        // Step 2: Generate new keys with sequential IDs to avoid collisions
-        let mut highest_existing_id = 0u32;
-
-        // Find the highest existing pre-key ID to start from
-        for id in 1..=16777215u32 {
-            match backend.load_prekey(id).await {
-                Ok(Some(_)) => {
-                    highest_existing_id = id;
-                }
-                Ok(None) => {
-                    break; // Found first gap
-                }
-                Err(e) => {
-                    // Don't silently ignore DB errors - could lead to ID collisions
-                    return Err(anyhow::anyhow!("Failed to load prekey {}: {}", id, e));
-                }
-            }
-        }
-
-        let start_id = highest_existing_id + 1;
+        // New IDs must continue past the highest existing one: consumed one-time
+        // pre-keys are removed after use, so the ID space has gaps and reusing an
+        // in-gap ID would overwrite a key the server may still hand out.
+        let max_existing_id = backend
+            .max_prekey_id()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query max prekey ID: {}", e))?;
+        let start_id = max_existing_id.map_or(1, |max| max.saturating_add(1));
 
         for i in 0..WANTED_PRE_KEY_COUNT {
             let pre_key_id = start_id + i as u32;

@@ -9,13 +9,13 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use log::warn;
 use prost::Message;
 use std::sync::Arc;
+use wa_rs_binary::jid::Jid;
 use wa_rs_core::appstate::hash::HashState;
 use wa_rs_core::appstate::processor::AppStateMutationMAC;
 use wa_rs_core::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wa_rs_core::store::Device as CoreDevice;
 use wa_rs_core::store::error::{Result, StoreError};
 use wa_rs_core::store::traits::*;
-use wa_rs_binary::jid::Jid;
 use wa_rs_proto::whatsapp as wa;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
@@ -1168,6 +1168,25 @@ impl SignalStore for SqliteStore {
         Ok(())
     }
 
+    async fn max_prekey_id(&self) -> Result<Option<u32>> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        tokio::task::spawn_blocking(move || -> Result<Option<u32>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(e.to_string()))?;
+            // MAX() returns a single row (NULL on empty table), so no `.optional()` needed.
+            let res: Option<i32> = prekeys::table
+                .select(diesel::dsl::max(prekeys::id))
+                .filter(prekeys::device_id.eq(device_id))
+                .first(&mut conn)
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            Ok(res.map(|id| id as u32))
+        })
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?
+    }
+
     async fn store_signed_prekey(&self, id: u32, record: &[u8]) -> Result<()> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -2028,12 +2047,13 @@ mod tests {
     use super::*;
 
     async fn create_test_store() -> SqliteStore {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let db_name = format!("file:memdb_test_{}?mode=memory&cache=shared", timestamp);
+        // Counter instead of a timestamp: parallel tests can get identical
+        // nanosecond timestamps, and two stores sharing one shared-cache
+        // in-memory DB name race their migrations ("table is locked").
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_name = format!("file:memdb_test_{id}?mode=memory&cache=shared");
         SqliteStore::new(&db_name)
             .await
             .expect("Failed to create test store")
@@ -2086,6 +2106,27 @@ mod tests {
         let result = parse_database_path(":memory:?cache=shared");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn test_max_prekey_id_with_gaps() {
+        let store = create_test_store().await;
+
+        assert_eq!(store.max_prekey_id().await.unwrap(), None);
+
+        // Store pre-keys 1..=3, then consume the middle one: one-time pre-keys
+        // are removed after use, so the stored ID space has gaps in production.
+        for id in 1..=3u32 {
+            store.store_prekey(id, &[0xAB; 8], true).await.unwrap();
+        }
+        store.remove_prekey(2).await.unwrap();
+
+        // Must return the true max, not stop at the first gap (which would
+        // make new key allocation overwrite still-live keys at higher IDs).
+        assert_eq!(store.max_prekey_id().await.unwrap(), Some(3));
+
+        store.remove_prekey(3).await.unwrap();
+        assert_eq!(store.max_prekey_id().await.unwrap(), Some(1));
     }
 
     #[tokio::test]

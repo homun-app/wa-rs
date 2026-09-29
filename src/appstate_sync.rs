@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use prost::Message;
 use tokio::sync::Mutex;
+use wa_rs_binary::node::Node;
 use wa_rs_core::appstate::hash::HashState;
 use wa_rs_core::appstate::keys::ExpandedAppStateKeys;
 use wa_rs_core::appstate::patch_decode::{PatchList, WAPatchName, parse_patch_list};
@@ -12,7 +13,6 @@ use wa_rs_core::appstate::{
     collect_key_ids_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
 use wa_rs_core::store::traits::Backend;
-use wa_rs_binary::node::Node;
 use wa_rs_proto::whatsapp as wa;
 
 // Re-export Mutation from wa_rs_core for backwards compatibility
@@ -70,10 +70,18 @@ impl AppStateProcessor {
         // Download external snapshot if present (matches WhatsApp Web behavior)
         if pl.snapshot.is_none()
             && let Some(ext) = &pl.snapshot_ref
-            && let Ok(data) = download(ext)
-            && let Ok(snapshot) = wa::SyncdSnapshot::decode(data.as_slice())
         {
-            pl.snapshot = Some(snapshot);
+            match download(ext) {
+                Ok(data) => match wa::SyncdSnapshot::decode(data.as_slice()) {
+                    Ok(snapshot) => pl.snapshot = Some(snapshot),
+                    Err(e) => {
+                        log::warn!(target: "AppState", "Failed to decode external snapshot: {}", e)
+                    }
+                },
+                Err(e) => {
+                    log::warn!(target: "AppState", "Failed to download external snapshot: {}", e)
+                }
+            }
         }
 
         // Download external mutations for each patch (matches WhatsApp Web behavior)
@@ -333,6 +341,7 @@ mod tests {
     use super::*;
     use prost::Message;
     use std::collections::HashMap;
+    use wa_rs_binary::jid::Jid;
     use wa_rs_core::appstate::WAPATCH_INTEGRITY;
     use wa_rs_core::appstate::hash::HashState;
     use wa_rs_core::appstate::hash::generate_content_mac;
@@ -344,7 +353,6 @@ mod tests {
         AppStateSyncKey, AppSyncStore, DeviceListRecord, DeviceStore, LidPnMappingEntry,
         ProtocolStore, SignalStore,
     };
-    use wa_rs_binary::jid::Jid;
 
     type MockMacMap = Arc<Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>>;
 
@@ -384,6 +392,9 @@ mod tests {
         }
         async fn remove_prekey(&self, _: u32) -> StoreResult<()> {
             Ok(())
+        }
+        async fn max_prekey_id(&self) -> StoreResult<Option<u32>> {
+            Ok(None)
         }
         async fn store_signed_prekey(&self, _: u32, _: &[u8]) -> StoreResult<()> {
             Ok(())
