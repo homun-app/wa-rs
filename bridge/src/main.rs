@@ -215,7 +215,24 @@ async fn send(
         );
     }
     // Accept bare phone numbers as well as full JIDs.
-    let jid_str = if to.contains('@') { to } else { format!("{to}@s.whatsapp.net") };
+    let mut jid_str = if to.contains('@') { to } else { format!("{to}@s.whatsapp.net") };
+    // Self-chat routing: replies addressed to the self-chat companion JID are
+    // accepted by the server but land in an invisible system chat. "Message
+    // yourself" renders notes sent to the account's own JID, so redirect.
+    {
+        let peer = state.self_chat_peer.read().await.clone();
+        if let Some(peer) = peer {
+            let bare = |s: &str| s.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+            let peer_user = bare(&peer);
+            if !peer_user.is_empty() && peer_user == bare(&jid_str) {
+                let own = state.jid.read().await.clone();
+                let own = if own.is_some() { own } else { state.lid.read().await.clone() };
+                if let Some(own) = own {
+                    jid_str = bare(&own) + "@s.whatsapp.net";
+                }
+            }
+        }
+    }
     let Ok(jid) = jid_str.parse() else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
