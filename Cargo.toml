@@ -16,6 +16,7 @@ categories = ["network-programming", "asynchronous"]
 [workspace]
 members = [
     ".",
+    "bridge",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
     "transports/tokio-transport",

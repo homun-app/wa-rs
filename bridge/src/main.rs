@@ -1,0 +1,352 @@
+//! Local HTTP sidecar bridging wa-rs to the Homun engine channel gateway.
+//!
+//! The Homun engine (or any local consumer) talks to this process over
+//! 127.0.0.1 HTTP; the sidecar owns the WhatsApp Web session and pushes
+//! inbound messages to a callback URL.
+//!
+//! Environment:
+//!   WA_BRIDGE_PORT            HTTP port (default 8902, binds 127.0.0.1 only)
+//!   WA_BRIDGE_DB              SQLite session path (default wa-bridge.db)
+//!   WA_BRIDGE_PHONE           Optional phone number for pair-code linking
+//!   WA_BRIDGE_PAIR_CODE       Optional custom 8-char pair code
+//!   WA_BRIDGE_CALLBACK_URL    Engine inbound URL for received messages
+//!   WA_BRIDGE_CALLBACK_TOKEN  Bearer token sent with the callback
+//!
+//! Pairing starts automatically at boot when no session exists: the QR
+//! payload (and, with WA_BRIDGE_PHONE, the pair code) surfaces via
+//! GET /status and POST /pair/start until the phone completes linking.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::State;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use tokio::sync::RwLock;
+use wa_rs::bot::{Bot, MessageContext};
+use wa_rs::client::Client;
+use wa_rs::pair_code::PairCodeOptions;
+use wa_rs_core::proto_helpers::MessageExt;
+use wa_rs_core::types::events::Event;
+use wa_rs_proto::whatsapp as wa;
+use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
+use wa_rs_ureq_http::UreqHttpClient;
+
+use wa_rs::store::SqliteStore;
+
+#[derive(Clone)]
+struct Callback {
+    url: String,
+    token: String,
+}
+
+struct AppState {
+    client: RwLock<Option<Arc<Client>>>,
+    qr: RwLock<Option<(String, DateTime<Utc>)>>,
+    pair_code: RwLock<Option<(String, DateTime<Utc>)>>,
+    jid: RwLock<Option<String>>,
+    connected: RwLock<bool>,
+    logged_out: RwLock<bool>,
+    last_error: RwLock<Option<String>>,
+    started_at: DateTime<Utc>,
+    callback: Callback,
+}
+
+impl AppState {
+    fn new(callback: Callback) -> Arc<Self> {
+        Arc::new(Self {
+            client: RwLock::new(None),
+            qr: RwLock::new(None),
+            pair_code: RwLock::new(None),
+            jid: RwLock::new(None),
+            connected: RwLock::new(false),
+            logged_out: RwLock::new(false),
+            last_error: RwLock::new(None),
+            started_at: Utc::now(),
+            callback,
+        })
+    }
+
+    async fn status_payload(self: &Arc<Self>) -> Value {
+        let jid = self.jid.read().await.clone();
+        let connected = *self.connected.read().await;
+        let logged_out = *self.logged_out.read().await;
+        let qr = self.qr.read().await.clone();
+        let pair_code = self.pair_code.read().await.clone();
+        let last_error = self.last_error.read().await.clone();
+        let paired = connected && !logged_out;
+        json!({
+            "ok": true,
+            "service": "wa-rs-bridge",
+            "version": env!("CARGO_PKG_VERSION"),
+            "paired": paired,
+            "jid": jid,
+            "connected": connected,
+            "logged_out": logged_out,
+            "started_at": self.started_at.to_rfc3339(),
+            "last_error": last_error,
+            "qr": qr.as_ref().map(|(payload, expires)| json!({
+                "payload": payload,
+                "expires_at": expires.to_rfc3339(),
+            })),
+            "pair_code": pair_code.as_ref().map(|(code, expires)| json!({
+                "code": code,
+                "expires_at": expires.to_rfc3339(),
+            })),
+        })
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+fn expires_in(timeout: Duration) -> DateTime<Utc> {
+    Utc::now() + chrono::TimeDelta::from_std(timeout).unwrap_or(chrono::TimeDelta::seconds(60))
+}
+
+/// Deliver an inbound message to the engine callback. Blocking ureq call on
+/// the tokio blocking pool; failures are logged, never fatal for the session.
+async fn push_callback(callback: &Callback, body: Value) {
+    if callback.url.is_empty() {
+        return;
+    }
+    let url = callback.url.clone();
+    let token = callback.token.clone();
+    let payload = body.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut req = ureq::post(&url);
+        req = req.header("Content-Type", "application/json");
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        if let Err(e) = req.send(payload.as_bytes()) {
+            log::warn!("callback to {url} failed: {e}");
+        }
+    })
+    .await
+    .ok();
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({"ok": true, "service": "wa-rs-bridge", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(state.status_payload().await)
+}
+
+async fn pair_start(State(state): State<Arc<AppState>>) -> Json<Value> {
+    // Pairing begins at boot; this endpoint reports the live QR/pair code.
+    Json(state.status_payload().await)
+}
+
+async fn send(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    let client = state.client.read().await.clone();
+    let Some(client) = client else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "bridge_not_ready"})),
+        );
+    };
+    let to = body.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let text = body.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if to.is_empty() || text.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "missing_to_or_text"})),
+        );
+    }
+    // Accept bare phone numbers as well as full JIDs.
+    let jid_str = if to.contains('@') { to } else { format!("{to}@s.whatsapp.net") };
+    let Ok(jid) = jid_str.parse() else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "invalid_jid"})),
+        );
+    };
+    let message = wa::Message {
+        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            text: Some(text),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    match client.send_message(jid, message).await {
+        Ok(id) => (axum::http::StatusCode::OK, Json(json!({"ok": true, "id": id}))),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(json!({"ok": false, "error": e.to_string()})),
+        ),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let port: u16 = env_or("WA_BRIDGE_PORT", "8902").parse().unwrap_or(8902);
+    let db_path = env_or("WA_BRIDGE_DB", "wa-bridge.db");
+    let phone = std::env::var("WA_BRIDGE_PHONE").ok().filter(|v| !v.trim().is_empty());
+    let custom_code = std::env::var("WA_BRIDGE_PAIR_CODE").ok().filter(|v| !v.trim().is_empty());
+    let callback = Callback {
+        url: env_or("WA_BRIDGE_CALLBACK_URL", ""),
+        token: env_or("WA_BRIDGE_CALLBACK_TOKEN", ""),
+    };
+
+    let state = AppState::new(callback);
+
+    let backend = match SqliteStore::new(&db_path).await {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            log::error!("failed to open session db {db_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut builder = Bot::builder()
+        .with_backend(backend)
+        .with_transport_factory(TokioWebSocketTransportFactory::new())
+        .with_http_client(UreqHttpClient::new());
+    if let Some(phone) = phone {
+        log::info!("pair-code linking enabled for phone {phone}");
+        builder = builder.with_pair_code(PairCodeOptions {
+            phone_number: phone,
+            custom_code,
+            ..Default::default()
+        });
+    }
+
+    let event_state = state.clone();
+    let mut bot = builder
+        .on_event(move |event, client| {
+            let state = event_state.clone();
+            async move {
+                // Publish the client for /send as soon as it exists.
+                {
+                    let mut guard = state.client.write().await;
+                    if guard.is_none() {
+                        *guard = Some(client.clone());
+                    }
+                }
+                match event {
+                    Event::PairingQrCode { code, timeout } => {
+                        log::info!("pairing QR available (valid {}s)", timeout.as_secs());
+                        *state.qr.write().await = Some((code, expires_in(timeout)));
+                    }
+                    Event::PairingCode { code, timeout } => {
+                        log::info!("pair code available: {code}");
+                        *state.pair_code.write().await = Some((code, expires_in(timeout)));
+                    }
+                    Event::PairSuccess(success) => {
+                        log::info!("paired as {}", success.id);
+                        *state.jid.write().await = Some(success.id.to_string());
+                        *state.logged_out.write().await = false;
+                    }
+                    Event::Connected(_) => {
+                        log::info!("WhatsApp session connected");
+                        *state.connected.write().await = true;
+                    }
+                    Event::Disconnected(_) => {
+                        log::warn!("WhatsApp session disconnected");
+                        *state.connected.write().await = false;
+                    }
+                    Event::LoggedOut(logout) => {
+                        log::error!("WhatsApp session logged out: {:?}", logout.reason);
+                        *state.logged_out.write().await = true;
+                        *state.connected.write().await = false;
+                        *state.jid.write().await = None;
+                    }
+                    Event::Message(msg, info) => {
+                        let ctx = MessageContext { message: msg, info, client };
+                        handle_message(&state, ctx).await;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .build()
+        .await
+        .expect("failed to build bot");
+
+    // The client exists right after build; publish it for /send.
+    {
+        let client = bot.client();
+        *state.client.write().await = Some(client);
+    }
+
+    let run_state = state.clone();
+    let handle = match bot.run().await {
+        Ok(handle) => handle,
+        Err(e) => {
+            log::error!("bot failed to start: {e}");
+            *run_state.last_error.write().await = Some(e.to_string());
+            std::process::exit(1);
+        }
+    };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/status", get(status))
+        .route("/pair/start", post(pair_start))
+        .route("/send", post(send))
+        .with_state(state);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("failed to bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    log::info!("wa-rs-bridge listening on http://{addr}");
+
+    let server = async move { axum::serve(listener, app).await };
+    tokio::pin!(server);
+    tokio::select! {
+        _ = &mut server => {}
+        result = handle => {
+            log::error!("bot task terminated: {:?}", result);
+        }
+    }
+}
+
+async fn handle_message(state: &Arc<AppState>, ctx: MessageContext) {
+    let info = &ctx.info;
+    // Own messages are skipped, except in the self-chat: notes the user writes
+    // to themselves on the phone sync to linked devices flagged is_from_me,
+    // and they are the primary input in personal "message yourself" mode.
+    if info.source.is_from_me {
+        let own_jid = state.jid.read().await.clone();
+        let chat = info.source.chat.to_string();
+        let is_self_chat = own_jid.as_deref() == Some(chat.as_str());
+        if !is_self_chat {
+            return;
+        }
+    }
+    let Some(text) = ctx.message.text_content() else {
+        return; // v1 bridges text messages only.
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    let body = json!({
+        "source": "wa-rs-bridge",
+        "message": {
+            "id": info.id.clone(),
+            "chat": info.source.chat.to_string(),
+            "sender": info.source.sender.to_string(),
+            "push_name": info.push_name.clone(),
+            "is_group": info.source.is_group,
+            "text": text,
+            "timestamp": info.timestamp.to_rfc3339(),
+        }
+    });
+    push_callback(&state.callback, body).await;
+}
