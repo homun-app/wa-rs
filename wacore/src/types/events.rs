@@ -74,25 +74,31 @@ impl LazyConversation {
     }
 
     /// Get the parsed conversation, parsing on first access.
-    /// Returns None if parsing fails (empty id indicates invalid conversation).
+    /// Returns `None` if parsing fails or the conversation has an empty id;
+    /// a decode failure (server-controlled data) is logged once.
     pub fn get(&self) -> Option<&wa::Conversation> {
-        let conv = self
-            .parsed
-            .get_or_init(|| wa::Conversation::decode(&self.raw_bytes[..]).unwrap_or_default());
+        let conv =
+            self.parsed
+                .get_or_init(|| match wa::Conversation::decode(&self.raw_bytes[..]) {
+                    Ok(conv) => conv,
+                    Err(e) => {
+                        log::warn!(
+                            target: "HistorySync",
+                            "Failed to decode conversation protobuf ({} bytes): {}",
+                            self.raw_bytes.len(),
+                            e
+                        );
+                        Default::default()
+                    }
+                });
         if conv.id.is_empty() { None } else { Some(conv) }
     }
 
     /// Get the parsed conversation, parsing on first access.
-    /// Panics if parsing fails (use `get()` for fallible access).
-    pub fn conversation(&self) -> &wa::Conversation {
-        self.parsed.get_or_init(|| {
-            let mut conv = wa::Conversation::decode(&self.raw_bytes[..])
-                .expect("Failed to decode conversation");
-            // Strip heavy fields after parsing to reduce memory
-            conv.messages.clear();
-            conv.messages.shrink_to_fit();
-            conv
-        })
+    /// Alias for [`LazyConversation::get`]: returns `None` on decode failure
+    /// instead of panicking, since the raw bytes come from the server.
+    pub fn conversation(&self) -> Option<&wa::Conversation> {
+        self.get()
     }
 }
 
@@ -158,12 +164,15 @@ impl CoreEventBus {
     }
 
     pub fn dispatch(&self, event: &Event) {
-        for handler in self
+        // Snapshot before invoking: a handler that (directly or transitively)
+        // registers a new handler would otherwise deadlock on the write lock,
+        // and a slow handler must not hold the read guard.
+        let handlers: Vec<Arc<dyn EventHandler>> = self
             .handlers
             .read()
             .expect("RwLock should not be poisoned")
-            .iter()
-        {
+            .clone();
+        for handler in handlers.iter() {
             handler.handle_event(event);
         }
     }
