@@ -47,6 +47,7 @@ struct AppState {
     qr: RwLock<Option<(String, DateTime<Utc>)>>,
     pair_code: RwLock<Option<(String, DateTime<Utc>)>>,
     jid: RwLock<Option<String>>,
+    lid: RwLock<Option<String>>,
     connected: RwLock<bool>,
     logged_out: RwLock<bool>,
     last_error: RwLock<Option<String>>,
@@ -62,6 +63,7 @@ impl AppState {
             qr: RwLock::new(None),
             pair_code: RwLock::new(None),
             jid: RwLock::new(None),
+            lid: RwLock::new(None),
             connected: RwLock::new(false),
             logged_out: RwLock::new(false),
             last_error: RwLock::new(None),
@@ -73,6 +75,7 @@ impl AppState {
 
     async fn status_payload(self: &Arc<Self>) -> Value {
         let jid = self.jid.read().await.clone();
+        let lid = self.lid.read().await.clone();
         let connected = *self.connected.read().await;
         let logged_out = *self.logged_out.read().await;
         let qr = self.qr.read().await.clone();
@@ -86,6 +89,7 @@ impl AppState {
             "version": env!("CARGO_PKG_VERSION"),
             "paired": paired,
             "jid": jid,
+            "lid": lid,
             "connected": connected,
             "logged_out": logged_out,
             "started_at": self.started_at.to_rfc3339(),
@@ -105,6 +109,35 @@ impl AppState {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+/// Persist the paired identities next to the session db, and restore them at
+/// boot: PairSuccess only fires on first linking, never on session resume.
+fn identity_path(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path).with_extension("identity.json")
+}
+
+fn persist_identity(db_path: &str, jid: &str, lid: &str) {
+    let doc = json!({"jid": jid, "lid": lid});
+    if let Err(e) = std::fs::write(identity_path(db_path), doc.to_string()) {
+        log::warn!("failed to persist bridge identity: {e}");
+    }
+}
+
+async fn restore_identity(state: &Arc<AppState>, db_path: &str) {
+    let Ok(raw) = std::fs::read_to_string(identity_path(db_path)) else {
+        return;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    if let Some(jid) = doc.get("jid").and_then(Value::as_str) {
+        *state.jid.write().await = Some(jid.to_string());
+    }
+    if let Some(lid) = doc.get("lid").and_then(Value::as_str) {
+        *state.lid.write().await = Some(lid.to_string());
+    }
+    log::info!("restored paired identity from session store");
 }
 
 fn expires_in(timeout: Duration) -> DateTime<Utc> {
@@ -210,6 +243,7 @@ async fn main() {
     };
 
     let state = AppState::new(callback);
+    restore_identity(&state, &db_path).await;
 
     let backend = match SqliteStore::new(&db_path).await {
         Ok(store) => Arc::new(store),
@@ -233,9 +267,11 @@ async fn main() {
     }
 
     let event_state = state.clone();
+    let events_db_path = db_path.clone();
     let mut bot = builder
         .on_event(move |event, client| {
             let state = event_state.clone();
+            let db_path = events_db_path.clone();
             async move {
                 // Publish the client for /send as soon as it exists.
                 {
@@ -254,10 +290,17 @@ async fn main() {
                         *state.pair_code.write().await = Some((code, expires_in(timeout)));
                     }
                     Event::PairSuccess(success) => {
-                        log::info!("paired as {}", success.id);
+                        log::info!("paired as {} (lid {})", success.id, success.lid);
+                        // A WhatsApp account has two wire identities: the phone
+                        // Jid and an opaque LID. Keep both: incoming traffic is
+                        // addressed with either, depending on the sender device.
+                        // They survive restarts via a sidecar file: PairSuccess
+                        // only fires on first linking, not on session resume.
                         *state.jid.write().await = Some(success.id.to_string());
+                        *state.lid.write().await = Some(success.lid.to_string());
                         *state.logged_out.write().await = false;
                         *state.last_pair_error.write().await = None;
+                        persist_identity(&db_path, &success.id.to_string(), &success.lid.to_string());
                     }
                     Event::PairError(err) => {
                         // The phone showed an error: keep the server-provided
@@ -344,13 +387,20 @@ async fn main() {
 async fn handle_message(state: &Arc<AppState>, ctx: MessageContext) {
     let info = &ctx.info;
     // Own messages are skipped, except in the self-chat: notes the user writes
-    // to themselves on the phone sync to linked devices flagged is_from_me,
-    // and they are the primary input in personal "message yourself" mode.
+    // to themselves on the phone sync to linked devices flagged is_from_me.
+    // The account owns two identities (phone Jid and LID), so the chat is
+    // compared by bare user part against both.
     if info.source.is_from_me {
-        let own_jid = state.jid.read().await.clone();
-        let chat = info.source.chat.to_string();
-        let is_self_chat = own_jid.as_deref() == Some(chat.as_str());
-        if !is_self_chat {
+        let jid = state.jid.read().await.clone();
+        let lid = state.lid.read().await.clone();
+        let own_users: Vec<String> = [jid, lid]
+            .into_iter()
+            .flatten()
+            .map(|full| full.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_string())
+            .filter(|user| !user.is_empty())
+            .collect();
+        let chat_user = info.source.chat.user.clone();
+        if !own_users.contains(&chat_user) {
             return;
         }
     }
